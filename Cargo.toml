@@ -1,0 +1,27 @@
+[package]
+name = "chebrium"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny animated UI/UX toolkit: springs, a software canvas, Lucide icons, Inter text and an immediate-mode widget kit shared by every Memrium program."
+
+[features]
+default = ["app", "appmenu"]
+# the Wayland window runtime (`chebrium::app`); a program that only paints into its own buffer can turn it off
+app = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:wayland-protocols", "appmenu"]
+
+# program menus in the desktop's menu bar (D-Bus)
+appmenu = ["dep:zbus"]
+
+[dependencies]
+zbus = { version = "5", optional = true }
+ttf-parser = "0.25"
+resvg = { version = "0.45", default-features = false }
+toml = "0.8"
+libc = "0.2"
+smithay-client-toolkit = { version = "0.19", optional = true }
+wayland-client = { version = "0.31", optional = true }
+# the fractional scale and the viewport (a program draws for the exact scale and says how big the surface is)
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
