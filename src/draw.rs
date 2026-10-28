@@ -40,4 +40,13 @@ pub trait Draw {
     /// A picture the backend holds under `handle` (a thumbnail in the shell's atlas). Painters without pictures
     /// leave it out.
     fn image(&mut self, _r: [f32; 4], _radius: f32, _handle: u32) {}
+    /// A panel of glass for what floats over content (a control pill, a tooltip). A painter that can read what is
+    /// behind it blurs and bends that; the default is a flat translucent plate: the tint, a faint rim and a bright edge
+    /// along the top.
+    fn glass(&mut self, r: [f32; 4], radius: f32, strength: f32, dark: bool) {
+        let base = if dark { [0.11, 0.11, 0.11] } else { [0.97, 0.98, 1.0] };
+        self.fill([r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0], radius + 1.0, [1.0; 3], 0.10 * strength);
+        self.fill(r, radius, base, 0.74 * strength);
+        self.fill([r[0] + radius * 0.7, r[1] + 0.5, (r[2] - radius * 1.4).max(0.0), 1.0], 0.5, [1.0; 3], if dark { 0.20 } else { 0.9 } * strength);
+    }
 }

@@ -229,6 +229,8 @@ pub struct Host {
     pub activated: bool,
     /// put this text on the clipboard
     pub copy: Option<String>,
+    /// put this picture (PNG bytes) on the clipboard
+    pub copy_image: Option<Vec<u8>>,
     /// ask for the clipboard's text: it arrives in `App::clipboard`
     pub paste: bool,
     /// the pointer shape to show (`None`: whatever the widgets under the pointer asked for)
@@ -291,6 +293,9 @@ pub trait App {
 
     /// The text of the clipboard, after `Host::paste`.
     fn clipboard(&mut self, _text: String, _host: &mut Host) {}
+
+    /// Files or text dropped on the window (from a drag of the Files app, or of selected text).
+    fn dropped(&mut self, _files: Vec<std::path::PathBuf>, _text: String, _host: &mut Host) {}
 
     /// The menus for the desktop's menu bar (View, Edit, ...). Called before every frame and sent only when they changed,
     /// so it is the place to say what is checked or disabled right now. Empty: the program has no menus there.
@@ -398,10 +403,15 @@ struct Runtime<A: App> {
     data_device: Option<DataDevice>,
     copy_source: Option<CopyPasteSource>,
     clip_text: String,
+    /// the picture on the clipboard when we copied one (then `clip_text` is empty)
+    clip_png: Vec<u8>,
     /// serial of the last key press or click: setting the clipboard needs one
     input_serial: u32,
     paste_out: Outbox<String>,
     paste_in: Inbox<String>,
+    /// what was dropped on the window: (files, text)
+    drop_out: Outbox<(Vec<std::path::PathBuf>, String)>,
+    drop_in: Inbox<(Vec<std::path::PathBuf>, String)>,
     perf: Perf,
     last_trim: std::time::Instant,
     menu: Option<crate::appmenu::Client>,
@@ -467,14 +477,26 @@ impl<A: App + 'static> Runtime<A> {
                 let source = self.data_device_manager.create_copy_paste_source(&self.qh, COPY_MIMES);
                 source.set_selection(dd, self.input_serial);
                 self.clip_text = text;
+                self.clip_png.clear();
+                self.copy_source = Some(source);
+            }
+        }
+        if let Some(png) = self.host.copy_image.take() {
+            if let Some(dd) = &self.data_device {
+                let source = self.data_device_manager.create_copy_paste_source(&self.qh, ["image/png"]);
+                source.set_selection(dd, self.input_serial);
+                self.clip_text.clear();
+                self.clip_png = png;
                 self.copy_source = Some(source);
             }
         }
         if std::mem::take(&mut self.host.paste) {
             if self.copy_source.is_some() {
-                // our own selection: no round trip through the compositor
-                let text = self.clip_text.clone();
-                self.paste_out.send(text);
+                // our own selection: no round trip through the compositor (a picture is no text to paste)
+                if self.clip_png.is_empty() {
+                    let text = self.clip_text.clone();
+                    self.paste_out.send(text);
+                }
             } else if let Some(dd) = &self.data_device {
                 if let Some(offer) = dd.data().selection_offer() {
                     if let Some(mime) = offer.with_mime_types(|m| COPY_MIMES.iter().find(|c| m.iter().any(|x| x == *c)).map(|s| s.to_string())) {
@@ -535,7 +557,13 @@ impl<A: App + 'static> Runtime<A> {
         let (w, h) = ((self.width as f32 * fs).round() as usize, (self.height as f32 * fs).round() as usize);
         self.frame.resize(w, h);
         for text in self.paste_in.drain() {
-            self.app.clipboard(text, &mut self.host);
+            // a field being edited takes the pasted text; otherwise the program does
+            if !self.state.insert_text(&text) {
+                self.app.clipboard(text, &mut self.host);
+            }
+        }
+        for (files, text) in self.drop_in.drain() {
+            self.app.dropped(files, text, &mut self.host);
         }
         if let Some(client) = &mut self.menu {
             for id in client.take() {
@@ -676,6 +704,13 @@ impl<A: App + 'static> Runtime<A> {
         let Some(key) = key else { return };
         if !self.state.key(key, mods) {
             self.app.key(key, mods, &mut self.host);
+        }
+        // Ctrl+C / X / V in a text field: the clipboard is the runtime's to reach
+        if let Some(t) = self.state.clip_out.take() {
+            self.host.copy = Some(t);
+        }
+        if std::mem::take(&mut self.state.want_paste) {
+            self.host.paste = true;
         }
         self.schedule();
     }
@@ -821,19 +856,78 @@ impl<A: App + 'static> PointerHandler for Runtime<A> {
                 _ => {}
             }
         }
+        // a move or resize the press asked for goes out with this press's serial now, not at the next frame (which may be
+        // far off while one is pending), when the pointer may be elsewhere and the serial is stale
+        self.window_ops();
         self.schedule();
     }
 }
 
 impl<A: App + 'static> DataDeviceHandler for Runtime<A> {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    // a drag came over the window: take files (or text) as a copy
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {
+        let Some(offer) = self.data_device.as_ref().and_then(|dd| dd.data().drag_offer()) else { return };
+        match drop_mime(&offer) {
+            Some(mime) => {
+                offer.set_actions(DndAction::Copy, DndAction::Copy);
+                offer.accept_mime_type(offer.serial, Some(mime));
+            }
+            None => offer.accept_mime_type(offer.serial, None),
+        }
+    }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
     fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
-        // someone else took the clipboard
-        self.copy_source = None;
+    // the compositor also reports our own `set_selection` back here, so this cannot tell that someone else took the
+    // clipboard (dropping the source then destroyed our own copy: a paste found nothing); `cancelled` says that
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        let Some(offer) = self.data_device.as_ref().and_then(|dd| dd.data().drag_offer()) else { return };
+        let Some(mime) = drop_mime(&offer) else { return };
+        let Ok(mut pipe) = offer.receive(mime.clone()) else { return };
+        let out = self.drop_out.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if pipe.read_to_end(&mut buf).is_ok() {
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if mime == "text/uri-list" {
+                    out.send((text.lines().filter_map(file_from_uri).collect(), String::new()));
+                } else {
+                    out.send((Vec::new(), text));
+                }
+            }
+            offer.finish();
+        });
     }
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+/// What to ask a drag for: the files when it has them, else its text.
+fn drop_mime(offer: &DragOffer) -> Option<String> {
+    offer.with_mime_types(|m| {
+        ["text/uri-list"].iter().chain(COPY_MIMES.iter()).find(|c| m.iter().any(|x| x == **c)).map(|s| s.to_string())
+    })
+}
+
+/// The path in a `file://` line of a `text/uri-list` (percent escapes decoded).
+fn file_from_uri(line: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let rest = line.trim().strip_prefix("file://")?;
+    let rest = &rest[rest.find('/')?..];
+    let b = rest.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(out)))
 }
 
 impl<A: App + 'static> DataOfferHandler for Runtime<A> {
@@ -844,9 +938,9 @@ impl<A: App + 'static> DataOfferHandler for Runtime<A> {
 impl<A: App + 'static> DataSourceHandler for Runtime<A> {
     fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
 
-    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: String, fd: WritePipe) {
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, mime: String, fd: WritePipe) {
         let mut f = std::fs::File::from(OwnedFd::from(fd));
-        let _ = f.write_all(self.clip_text.as_bytes());
+        let _ = if mime == "image/png" { f.write_all(&self.clip_png) } else { f.write_all(self.clip_text.as_bytes()) };
     }
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
@@ -916,6 +1010,7 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
     let shm = Shm::bind(&globals, &qh).expect("wl_shm");
     let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).expect("wl_data_device_manager");
     let (paste_out, paste_in) = channel::<String>();
+    let (drop_out, drop_in) = channel::<(Vec<std::path::PathBuf>, String)>();
     let surface = compositor.create_surface(&qh);
     // the compositor draws the frame, so the program only paints its content
     let decorations = match config.decorations {
@@ -977,9 +1072,12 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         data_device: None,
         copy_source: None,
         clip_text: String::new(),
+        clip_png: Vec::new(),
         input_serial: 0,
         paste_out,
         paste_in,
+        drop_out,
+        drop_in,
         perf: Perf { on: std::env::var_os("CHEBRIUM_PERF").is_some(), ..Default::default() },
         last_trim: std::time::Instant::now(),
         menu: None,
@@ -987,6 +1085,7 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
     let (ping, source) = smithay_client_toolkit::reexports::calloop::ping::make_ping().expect("wake-up channel");
     loop_handle.insert_source(source, |_, _, rt: &mut Runtime<A>| rt.schedule()).expect("wake-up source");
     rt.paste_in.connect(Waker(ping.clone()));
+    rt.drop_in.connect(Waker(ping.clone()));
     if !rt.app.menus().is_empty() {
         let waker = Waker(ping.clone());
         rt.menu = crate::appmenu::Client::connect(&config.app_id, move || waker.wake());

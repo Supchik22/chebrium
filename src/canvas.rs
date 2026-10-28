@@ -269,6 +269,327 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Liquid glass over what is already painted: the pixels under the rounded rectangle are blurred, bent at the
+    /// rim like a lens, tinted and given a lit edge. `scale` is the HiDPI factor of the canvas.
+    ///
+    /// It is cheap because the blur never sees the full picture: the backdrop is sampled sparsely into a copy 4x smaller
+    /// in each direction, blurred there, and read back with bilinear filtering (a blur hides the loss). The lens maths
+    /// runs only in the band along the edge; the interior is one filtered read and one blend per pixel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn glass_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, dark: bool, strength: f32, scale: f32) {
+        const F: usize = 4;
+        let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+        let r = r.min(hw).min(hh);
+        let clip = self.clip;
+        let (bx0, by0) = ((x.floor() as i32).max(clip[0]), (y.floor() as i32).max(clip[1]));
+        let (bx1, by1) = (((x + w).ceil() as i32).min(clip[2]), ((y + h).ceil() as i32).min(clip[3]));
+        if bx0 >= bx1 || by0 >= by1 {
+            return;
+        }
+        // the backdrop the blur reads: the glass plus a margin, clamped to the canvas
+        let m = (10.0 * scale).ceil() as i32;
+        let (rx0, ry0) = ((x.floor() as i32 - m).max(0), (y.floor() as i32 - m).max(0));
+        let (rx1, ry1) = (((x + w).ceil() as i32 + m).min(self.w as i32), ((y + h).ceil() as i32 + m).min(self.h as i32));
+        // the backdrop at full resolution, before anything is drawn over it: the lens at the rim bends this, so the
+        // deformation of the picture near the edge and the corners is sharp while the middle stays frosted
+        let (rw, rh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
+        let mut sharp = Vec::with_capacity(rw * rh * 4);
+        for yy in ry0..ry1 {
+            let o = (yy as usize * self.w + rx0 as usize) * 4;
+            sharp.extend_from_slice(&self.data[o..o + rw * 4]);
+        }
+        let (lw, lh) = (((rx1 - rx0) as usize).div_ceil(F).max(1), ((ry1 - ry0) as usize).div_ceil(F).max(1));
+        let mut lo = vec![[0f32; 4]; lw * lh];
+        for ly in 0..lh {
+            for lx in 0..lw {
+                // eight taps of the 4x4 block (a checker): less shimmer when the picture under the glass moves
+                let mut acc = [0f32; 4];
+                for (ox, oy) in [(0, 0), (2, 0), (1, 1), (3, 1), (0, 2), (2, 2), (1, 3), (3, 3)] {
+                    let sx = (rx0 as usize + lx * F + ox).min(rx1 as usize - 1);
+                    let sy = (ry0 as usize + ly * F + oy).min(ry1 as usize - 1);
+                    let i = (sy * self.w + sx) * 4;
+                    for k in 0..4 {
+                        acc[k] += self.data[i + k] as f32;
+                    }
+                }
+                // the buffer is B,G,R,A; the small copy is R,G,B,A
+                lo[ly * lw + lx] = [acc[2], acc[1], acc[0], acc[3]].map(|v| v * (1.0 / (8.0 * 255.0)));
+            }
+        }
+        // two box passes in each direction ~ a gaussian of about 11 px
+        let mut tmp = vec![[0f32; 4]; lw * lh];
+        for _ in 0..2 {
+            box_blur(&lo, &mut tmp, lw, lh, 2, true);
+            box_blur(&tmp, &mut lo, lw, lh, 2, false);
+        }
+        let strength = strength.clamp(0.0, 1.5);
+        // a pale, thin tint so that the backdrop shows through and stays vivid; in the dark theme the backdrop is also
+        // dimmed a little so that white icons read over a bright picture
+        let (tint, ta, dim, sat) = if dark { ([0.80f32, 0.86, 0.95], 0.16 * strength, 0.80, 1.55) } else { ([1.0f32, 1.0, 1.0], 0.34 * strength, 1.0, 1.35) };
+        let band = (hh.min(hw) * 0.7).min(18.0 * scale).max(1.0);
+        let rim_w = (1.5 * scale).max(1.0);
+        let bend = band;
+        let light = [-0.5f32, -0.866];
+        // the light on the edge: a thin bright rim, and under it a soft glow that fades over the lens band (the glass
+        // catches more light where it is steep), stronger on the side facing the light and faint on the far side
+        let lighting = |nx: f32, ny: f32, depth: f32| -> f32 {
+            let lit = nx * light[0] + ny * light[1];
+            let facing = lit.max(0.0) + (-lit).max(0.0) * 0.5;
+            let mut v = 0.0;
+            if depth < rim_w {
+                v = (1.0 - depth.max(0.0) / rim_w) * (if dark { 0.30 } else { 0.55 } + facing * if dark { 0.65 } else { 0.5 });
+            }
+            if depth < band {
+                let u = 1.0 - depth.max(0.0) / band;
+                v += u * u * u * (0.05 + facing * 0.11) * if dark { 1.0 } else { 0.6 };
+            }
+            v.min(0.95) * strength
+        };
+        let (tr, tg, tb) = (tint[0] * ta, tint[1] * ta, tint[2] * ta);
+        let keep = 1.0 - ta;
+        // the tint and the colour lift are affine, so they are applied to the small copy once, not to every pixel
+        let shade = |c: [f32; 4], sheen: f32| -> [f32; 4] {
+            let lum = (c[0] + c[1] + c[2]) * (1.0 / 3.0);
+            let ga = ta + c[3] * keep;
+            let lift = |v: f32, t: f32| (t + (lum + (v - lum) * sat).max(0.0) * dim * keep).min(ga);
+            let mut g = [lift(c[0], tr), lift(c[1], tg), lift(c[2], tb)];
+            for v in &mut g {
+                *v = *v * (1.0 - sheen) + sheen * ga;
+            }
+            [g[0], g[1], g[2], ga]
+        };
+        // a gloss over the upper part of the panel, fading downwards
+        let sheen_at = |py: f32| 0.16 * strength * (1.0 - (py - y) / (h * 0.62)).clamp(0.0, 1.0);
+        for (i, c) in lo.iter_mut().enumerate() {
+            *c = shade(*c, sheen_at(ry0 as f32 + ((i / lw) as f32 + 0.5) * F as f32));
+        }
+        let (data, stride) = (&mut *self.data, self.w);
+        let sample = |px: f32, py: f32| -> [f32; 4] {
+            let u = ((px - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+            let v = ((py - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+            let (u0, v0) = (u as usize, v as usize);
+            let (u1, v1) = ((u0 + 1).min(lw - 1), (v0 + 1).min(lh - 1));
+            let (fu, fv) = (u - u0 as f32, v - v0 as f32);
+            let (a, b, c, d) = (lo[v0 * lw + u0], lo[v0 * lw + u1], lo[v1 * lw + u0], lo[v1 * lw + u1]);
+            let mut o = [0f32; 4];
+            for k in 0..4 {
+                o[k] = (a[k] * (1.0 - fu) + b[k] * fu) * (1.0 - fv) + (c[k] * (1.0 - fu) + d[k] * fu) * fv;
+            }
+            o
+        };
+        // the rim is thin, so the nearest pixel is enough (and one read instead of four)
+        let sample_sharp = |px: f32, py: f32| -> [f32; 4] {
+            let u = ((px - rx0 as f32) as usize).min(rw - 1);
+            let v = ((py - ry0 as f32) as usize).min(rh - 1);
+            let i = (v * rw + u) * 4;
+            [sharp[i + 2] as f32 * (1.0 / 255.0), sharp[i + 1] as f32 * (1.0 / 255.0), sharp[i] as f32 * (1.0 / 255.0), sharp[i + 3] as f32 * (1.0 / 255.0)]
+        };
+        // shade one pixel: read the (bent) blurred backdrop, tint it, light the rim, blend by coverage
+        let put = |data: &mut [u8], px: i32, py: i32, sx: f32, sy: f32, rim: f32, cov: f32, w: f32| {
+            let mut b = sample(sx, sy);
+            if w > 0.0 {
+                let sh = shade(sample_sharp(sx, sy), sheen_at(sy));
+                for k in 0..4 {
+                    b[k] = b[k] * (1.0 - w) + sh[k] * w;
+                }
+            }
+            let ga = b[3];
+            let mut g = [b[0], b[1], b[2]];
+            if rim > 0.0 {
+                for v in &mut g {
+                    *v = *v * (1.0 - rim) + rim * ga;
+                }
+            }
+            let i = (py as usize * stride + px as usize) * 4;
+            let new = [g[2], g[1], g[0], ga];
+            let icov = 1.0 - cov;
+            for k in 0..4 {
+                let v = (new[k].min(ga).min(1.0)) * 255.0;
+                data[i + k] = (data[i + k] as f32 * icov + v * cov + 0.5) as u8;
+            }
+        };
+        // the part of the glass deeper than `band` has no lens and no rim: the same shape pulled in by `band`
+        let mut rowbuf = vec![[0f32; 4]; lw];
+        let (iw, ih, ir) = (hw - band, hh - band, (r - band).max(0.0));
+        // a soft shadow just below the panel, in the ring around it only (the glass covers the rest)
+        let sm = (6.0 * scale).ceil() as i32;
+        let off = 2.0 * scale;
+        if strength > 0.01 {
+            let (sx0, sx1) = ((bx0 - sm).max(clip[0]), (bx1 + sm).min(clip[2]));
+            let (sy0, sy1) = ((by0 - sm).max(clip[1]), (by1 + sm + off.ceil() as i32).min(clip[3]));
+            for py in sy0..sy1 {
+                let fy = py as f32 + 0.5;
+                let dy = (fy - cy).abs();
+                // along a row the glass covers a known stretch; the shadow is only outside it
+                let (s0, s1) = if dy < hh {
+                    let over = dy - (hh - r);
+                    let half = if over > 0.0 { hw - r + (r * r - over * over).max(0.0).sqrt() } else { hw };
+                    (((cx - half + 1.0).ceil() as i32).clamp(sx0, sx1), ((cx + half - 1.0).floor() as i32).clamp(sx0, sx1))
+                } else {
+                    (sx1, sx1)
+                };
+                for px in (sx0..s0).chain(s1..sx1) {
+                    let fx = px as f32 + 0.5;
+                    let d = sd_round_rect(fx, fy - off, cx, cy, hw, hh, r);
+                    if d >= sm as f32 {
+                        continue;
+                    }
+                    let t = 1.0 - d.max(0.0) / sm as f32;
+                    let a = 0.30 * strength * t * t;
+                    let i = (py as usize * stride + px as usize) * 4;
+                    for k in 0..3 {
+                        data[i + k] = (data[i + k] as f32 * (1.0 - a) + 0.5) as u8;
+                    }
+                    data[i + 3] = (255.0 * a + data[i + 3] as f32 * (1.0 - a) + 0.5) as u8;
+                }
+            }
+        }
+        for py in by0..by1 {
+            let fy = py as f32 + 0.5;
+            let dy = (fy - cy).abs();
+            // the interior of this row, [ix0, ix1)
+            let (ix0, ix1) = if dy < ih {
+                let over = dy - (ih - ir);
+                let half = if over > 0.0 { iw - ir + (ir * ir - over * over).max(0.0).sqrt() } else { iw };
+                (((cx - half).ceil() as i32).max(bx0), ((cx + half).floor() as i32).min(bx1))
+            } else {
+                (bx1, bx1)
+            };
+            let edge = |data: &mut [u8], px: i32| {
+                let fx = px as f32 + 0.5;
+                let (dx, dyy) = (fx - cx, fy - cy);
+                let (qx, qy) = (dx.abs() - hw + r, dyy.abs() - hh + r);
+                let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    return;
+                }
+                let depth = -d;
+                // outward normal of the rounded rectangle
+                let (nx, ny) = if qx > 0.0 && qy > 0.0 {
+                    let l = qx.hypot(qy);
+                    (qx / l * dx.signum(), qy / l * dyy.signum())
+                } else if qx > qy {
+                    (dx.signum(), 0.0)
+                } else {
+                    (0.0, dyy.signum())
+                };
+                let (mut sx, mut sy, mut rim, mut w) = (fx, fy, 0.0, 0.0);
+                if depth < band {
+                    // a lens: near the edge the glass shows what lies further in, squeezed
+                    let t = (depth.max(0.0) / band).min(1.0);
+                    let k = (1.0 - t) * (1.0 - t) * bend;
+                    sx -= nx * k;
+                    sy -= ny * k;
+                    let u = 1.0 - t;
+                    w = ((u - 0.45) / 0.55).max(0.0) * 0.95;
+                    rim = lighting(nx, ny, depth);
+                }
+                put(data, px, py, sx, sy, rim, cov, w);
+            };
+            if ix0 >= ix1 {
+                // a row in the top or bottom band: along its flat stretch the normal is straight up or down, so the lens
+                // shift, the rim and the coverage are the same for every pixel and the row is one horizontal lerp
+                let half = (hw - r).min(hw - hh + dy).max(0.0);
+                let (fx0, fx1) = (((cx - half).ceil() as i32).clamp(bx0, bx1), ((cx + half).floor() as i32).clamp(bx0, bx1));
+                let d = dy - hh;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if fx0 >= fx1 || cov <= 0.0 {
+                    for px in bx0..bx1 {
+                        edge(&mut *data, px);
+                    }
+                    continue;
+                }
+                for px in bx0..fx0 {
+                    edge(&mut *data, px);
+                }
+                let depth = -d;
+                let ny = if fy < cy { -1.0 } else { 1.0 };
+                let (mut sy, mut rim, mut w) = (fy, 0.0, 0.0);
+                if depth < band {
+                    let t = (depth.max(0.0) / band).min(1.0);
+                    sy -= ny * (1.0 - t) * (1.0 - t) * bend;
+                    w = ((1.0 - t - 0.45) / 0.55).max(0.0) * 0.95;
+                    rim = lighting(0.0, ny, depth);
+                }
+                let v = ((sy - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+                let (v0, fv) = (v as usize, v - v as usize as f32);
+                let v1 = (v0 + 1).min(lh - 1);
+                for (i, row) in rowbuf.iter_mut().enumerate() {
+                    let (a, b) = (lo[v0 * lw + i], lo[v1 * lw + i]);
+                    for k in 0..4 {
+                        row[k] = a[k] + (b[k] - a[k]) * fv;
+                    }
+                }
+                let icov = 1.0 - cov;
+                for px in fx0..fx1 {
+                    let u = ((px as f32 + 0.5 - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+                    let (u0, fu) = (u as usize, u - u as usize as f32);
+                    let (a, b) = (rowbuf[u0], rowbuf[(u0 + 1).min(lw - 1)]);
+                    let mut g = [0f32; 4];
+                    for k in 0..4 {
+                        g[k] = a[k] + (b[k] - a[k]) * fu;
+                    }
+                    if w > 0.0 {
+                        let sh = shade(sample_sharp(px as f32 + 0.5, sy), sheen_at(sy));
+                        for k in 0..4 {
+                            g[k] = g[k] * (1.0 - w) + sh[k] * w;
+                        }
+                    }
+                    if rim > 0.0 {
+                        let ga = g[3];
+                        for v in &mut g[..3] {
+                            *v = *v * (1.0 - rim) + rim * ga;
+                        }
+                    }
+                    let o = (py as usize * stride + px as usize) * 4;
+                    let new = [g[2], g[1], g[0], g[3]];
+                    let dst = &mut data[o..o + 4];
+                    if cov >= 1.0 {
+                        for k in 0..4 {
+                            dst[k] = (new[k] * 255.0 + 0.5) as u8;
+                        }
+                    } else {
+                        for k in 0..4 {
+                            dst[k] = (dst[k] as f32 * icov + new[k] * 255.0 * cov + 0.5) as u8;
+                        }
+                    }
+                }
+                for px in fx1..bx1 {
+                    edge(&mut *data, px);
+                }
+                continue;
+            }
+            for px in bx0..ix0 {
+                edge(&mut *data, px);
+            }
+            // the interior: blend the two cell rows once, then only a horizontal lerp per pixel
+            let v = ((fy - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+            let (v0, fv) = (v as usize, v - v as usize as f32);
+            let v1 = (v0 + 1).min(lh - 1);
+            for (i, row) in rowbuf.iter_mut().enumerate() {
+                let (a, b) = (lo[v0 * lw + i], lo[v1 * lw + i]);
+                for k in 0..4 {
+                    row[k] = a[k] + (b[k] - a[k]) * fv;
+                }
+            }
+            for px in ix0..ix1 {
+                let u = ((px as f32 + 0.5 - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+                let (u0, fu) = (u as usize, u - u as usize as f32);
+                let (a, b) = (rowbuf[u0], rowbuf[(u0 + 1).min(lw - 1)]);
+                let o = (py as usize * stride + px as usize) * 4;
+                let dst = &mut data[o..o + 4];
+                dst[0] = ((a[2] + (b[2] - a[2]) * fu) * 255.0 + 0.5) as u8;
+                dst[1] = ((a[1] + (b[1] - a[1]) * fu) * 255.0 + 0.5) as u8;
+                dst[2] = ((a[0] + (b[0] - a[0]) * fu) * 255.0 + 0.5) as u8;
+                dst[3] = ((a[3] + (b[3] - a[3]) * fu) * 255.0 + 0.5) as u8;
+            }
+            for px in ix1..bx1 {
+                edge(&mut *data, px);
+            }
+        }
+    }
+
     /// Cut the four corners of the whole canvas to a rounded shape (alpha mask).
     pub fn mask_round_corners(&mut self, r: f32) {
         let (w, h) = (self.w as f32, self.h as f32);
@@ -303,6 +624,30 @@ impl<'a> Canvas<'a> {
                     let k = (cov as f32 / 255.0).powf(0.85);
                     self.blend(x + g.xmin + col as i32, top + row as i32, c, a * k);
                 }
+            }
+        }
+    }
+}
+
+/// Box blur of `r` cells either side with the edge repeated, along rows (`horizontal`) or columns.
+fn box_blur(src: &[[f32; 4]], dst: &mut [[f32; 4]], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (lines, len, step, line_step) = if horizontal { (h, w, 1, w) } else { (w, h, w, 1) };
+    let inv = 1.0 / (2 * r + 1) as f32;
+    for l in 0..lines {
+        let base = l * line_step;
+        let at = |i: isize| src[base + i.clamp(0, len as isize - 1) as usize * step];
+        let mut sum = [0f32; 4];
+        for i in -(r as isize)..=(r as isize) {
+            let p = at(i);
+            for k in 0..4 {
+                sum[k] += p[k];
+            }
+        }
+        for i in 0..len {
+            dst[base + i * step] = sum.map(|v| v * inv);
+            let (add, sub) = (at((i + r + 1) as isize), at(i as isize - r as isize));
+            for k in 0..4 {
+                sum[k] += add[k] - sub[k];
             }
         }
     }

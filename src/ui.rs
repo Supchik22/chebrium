@@ -64,13 +64,20 @@ pub struct State {
     edit: Option<(String, String)>,
     /// Enter (true) or Esc (false) was pressed; the field handles it on the next frame
     edit_end: Option<bool>,
+    /// the caret (a character index into the text being edited) and the other end of the selection, if any
+    edit_cur: usize,
+    edit_sel: Option<usize>,
+    /// text a Ctrl+C / Ctrl+X in a field wants on the clipboard, and a Ctrl+V that wants the clipboard's text: the runtime
+    /// carries both out
+    pub clip_out: Option<String>,
+    pub want_paste: bool,
     pub anims: Anims,
     last: Option<Instant>,
 }
 
 impl Default for State {
     fn default() -> State {
-        State { cursor: Cursor::Default, mouse: [-1000.0; 2], held: false, click: false, double: false, mods: KeyMods::default(), scroll: 0.0, last_click: None, drag: None, edit: None, edit_end: None, anims: Anims::default(), last: None }
+        State { cursor: Cursor::Default, mouse: [-1000.0; 2], held: false, click: false, double: false, mods: KeyMods::default(), scroll: 0.0, last_click: None, drag: None, edit: None, edit_end: None, edit_cur: 0, edit_sel: None, clip_out: None, want_paste: false, anims: Anims::default(), last: None }
     }
 }
 
@@ -96,6 +103,9 @@ impl State {
     /// Start editing the text field `key` with `text` already in it (rename on F2, say).
     pub fn begin_edit(&mut self, key: &str, text: &str) {
         self.edit = Some((key.to_string(), text.to_string()));
+        // the whole text is selected: typing replaces it (a rename)
+        self.edit_cur = text.chars().count();
+        self.edit_sel = Some(0);
     }
 
     pub fn pointer_up(&mut self) {
@@ -106,15 +116,104 @@ impl State {
     /// A key press while a text field is being edited. True when it was used.
     pub fn key(&mut self, k: Key, mods: KeyMods) -> bool {
         let Some((_, buf)) = self.edit.as_mut() else { return false };
+        let len = buf.chars().count();
+        self.edit_cur = self.edit_cur.min(len);
+        let byte = |buf: &str, i: usize| buf.char_indices().nth(i).map_or(buf.len(), |(b, _)| b);
+        // the selected span, as character indices
+        let span = |cur: usize, sel: Option<usize>| sel.map(|a| (a.min(cur), a.max(cur))).filter(|(a, b)| a != b);
         match k {
-            Key::Char(c) if !mods.ctrl && !mods.alt => buf.push(c),
-            Key::Backspace => {
-                buf.pop();
+            Key::Char(c) if mods.ctrl && !mods.alt => match c {
+                'a' => {
+                    self.edit_sel = Some(0);
+                    self.edit_cur = len;
+                }
+                'c' | 'x' => {
+                    if let Some((a, b)) = span(self.edit_cur, self.edit_sel) {
+                        self.clip_out = Some(buf[byte(buf, a)..byte(buf, b)].to_string());
+                        if c == 'x' {
+                            buf.replace_range(byte(buf, a)..byte(buf, b), "");
+                            self.edit_cur = a;
+                            self.edit_sel = None;
+                        }
+                    }
+                }
+                'v' => self.want_paste = true,
+                _ => {}
+            },
+            Key::Char(ch) if !mods.alt => {
+                if let Some((a, b)) = span(self.edit_cur, self.edit_sel) {
+                    buf.replace_range(byte(buf, a)..byte(buf, b), "");
+                    self.edit_cur = a;
+                }
+                let at = byte(buf, self.edit_cur);
+                buf.insert(at, ch);
+                self.edit_cur += 1;
+                self.edit_sel = None;
+            }
+            Key::Backspace | Key::Delete => {
+                if let Some((a, b)) = span(self.edit_cur, self.edit_sel) {
+                    buf.replace_range(byte(buf, a)..byte(buf, b), "");
+                    self.edit_cur = a;
+                } else if k == Key::Backspace && self.edit_cur > 0 {
+                    // Ctrl takes a whole word
+                    let mut from = self.edit_cur - 1;
+                    if mods.ctrl {
+                        let chars: Vec<char> = buf.chars().collect();
+                        while from > 0 && chars[from].is_whitespace() {
+                            from -= 1;
+                        }
+                        while from > 0 && !chars[from - 1].is_whitespace() {
+                            from -= 1;
+                        }
+                    }
+                    buf.replace_range(byte(buf, from)..byte(buf, self.edit_cur), "");
+                    self.edit_cur = from;
+                } else if k == Key::Delete && self.edit_cur < len {
+                    buf.replace_range(byte(buf, self.edit_cur)..byte(buf, self.edit_cur + 1), "");
+                }
+                self.edit_sel = None;
+            }
+            Key::Left | Key::Right | Key::Home | Key::End => {
+                let to = match k {
+                    Key::Left => match span(self.edit_cur, self.edit_sel) {
+                        Some((a, _)) if !mods.shift => a,
+                        _ => self.edit_cur.saturating_sub(1),
+                    },
+                    Key::Right => match span(self.edit_cur, self.edit_sel) {
+                        Some((_, b)) if !mods.shift => b,
+                        _ => (self.edit_cur + 1).min(len),
+                    },
+                    Key::Home => 0,
+                    _ => len,
+                };
+                if mods.shift {
+                    self.edit_sel.get_or_insert(self.edit_cur);
+                } else {
+                    self.edit_sel = None;
+                }
+                self.edit_cur = to;
             }
             Key::Enter => self.edit_end = Some(true),
             Key::Esc => self.edit_end = Some(false),
             _ => {}
         }
+        true
+    }
+
+    /// Text from the clipboard goes into the field being edited (one line: line breaks become spaces).
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        let Some((_, buf)) = self.edit.as_mut() else { return false };
+        let clean: String = text.chars().map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c }).collect();
+        let len = buf.chars().count();
+        let cur = self.edit_cur.min(len);
+        let byte = |buf: &str, i: usize| buf.char_indices().nth(i).map_or(buf.len(), |(b, _)| b);
+        let (a, b) = match self.edit_sel.map(|s| (s.min(cur), s.max(cur))) {
+            Some((a, b)) if a != b => (a, b),
+            _ => (cur, cur),
+        };
+        buf.replace_range(byte(buf, a)..byte(buf, b), &clean);
+        self.edit_cur = a + clean.chars().count();
+        self.edit_sel = None;
         true
     }
 
@@ -166,6 +265,8 @@ pub struct Ui<'a> {
     drag: &'a mut Option<u64>,
     edit: &'a mut Option<(String, String)>,
     edit_end: &'a mut Option<bool>,
+    edit_cur: &'a mut usize,
+    edit_sel: &'a mut Option<usize>,
     /// the field being edited was drawn this frame (otherwise its page is gone and the edit is dropped)
     pub edit_seen: bool,
     pub ink: [f32; 3],
@@ -187,13 +288,15 @@ pub struct Ui<'a> {
 
 impl<'a> Ui<'a> {
     pub fn new(d: &'a mut dyn Draw, state: &'a mut State, style: Style, dt: f32) -> Ui<'a> {
-        let State { mouse, held, click, double, mods, scroll, drag, edit, edit_end, anims, cursor, .. } = state;
-        Ui { d, mouse: *mouse, held: *held, click: *click, double: *double, mods: *mods, scroll: *scroll, drag, edit, edit_end, edit_seen: false, ink: style.ink, accent: style.accent, dark: style.dark, controls: style.controls, tint: None, next: 0, mask: false, changed: false, anim: anims, cursor, dt }
+        let State { mouse, held, click, double, mods, scroll, drag, edit, edit_end, edit_cur, edit_sel, anims, cursor, .. } = state;
+        Ui { d, mouse: *mouse, held: *held, click: *click, double: *double, mods: *mods, scroll: *scroll, drag, edit, edit_end, edit_cur, edit_sel, edit_seen: false, ink: style.ink, accent: style.accent, dark: style.dark, controls: style.controls, tint: None, next: 0, mask: false, changed: false, anim: anims, cursor, dt }
     }
 
     /// Start editing the text field `key` with `text` already in it (rename on F2, say).
     pub fn begin_edit(&mut self, key: &str, text: &str) {
         *self.edit = Some((key.to_string(), text.to_string()));
+        *self.edit_cur = text.chars().count();
+        *self.edit_sel = Some(0);
     }
 
     /// Is some text field being edited?
@@ -212,6 +315,11 @@ impl<'a> Ui<'a> {
     /// Glide a value towards `target` (a sliding highlight, a switch knob ...): `speed` is how fast, per second.
     pub fn ease(&mut self, key: u64, target: f32, speed: f32) -> f32 {
         self.anim.ease(key, target, speed, self.dt)
+    }
+
+    /// Seconds since the previous frame: a program's own springs step by it.
+    pub fn dt(&self) -> f32 {
+        self.dt
     }
 
     /// Jump an eased value to `value` with no glide.
@@ -266,13 +374,10 @@ impl<'a> Ui<'a> {
         self.d.measure(t, size, bold)
     }
 
-    /// A panel of glass for what floats over content (a control pill, a tooltip): the theme's tint, a faint light rim and a
-    /// bright edge along the top. (The software painter cannot blur what is behind it; the shell does that for whole windows.)
+    /// A panel of glass for what floats over content (a control pill, a tooltip): over the program's own picture it
+    /// blurs and bends what is behind it. (The software painter cannot see other windows; the shell frosts those.)
     pub fn glass(&mut self, r: [f32; 4], radius: f32, strength: f32) {
-        let base = if self.dark { [0.11, 0.11, 0.11] } else { [0.97, 0.98, 1.0] };
-        self.fill([r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0], radius + 1.0, [1.0; 3], 0.10 * strength);
-        self.fill(r, radius, base, 0.74 * strength);
-        self.fill([r[0] + radius * 0.7, r[1] + 0.5, (r[2] - radius * 1.4).max(0.0), 1.0], 0.5, [1.0; 3], if self.dark { 0.20 } else { 0.9 } * strength);
+        self.d.glass(r, radius, strength, self.dark);
     }
 
     /// Clip what follows to `r` until `pop_clip` (clips nest).
@@ -374,7 +479,25 @@ impl<'a> Ui<'a> {
         if self.click {
             if hov && !active {
                 *self.edit = Some((key.to_string(), value.clone()));
+                *self.edit_cur = value.chars().count();
+                *self.edit_sel = None;
                 active = true;
+            } else if hov && active {
+                // a click inside puts the caret between the letters nearest to it
+                if let Some((_, buf)) = self.edit.clone() {
+                    let want = self.mouse[0] - (r[0] + 9.0);
+                    let mut best = (f32::MAX, 0usize);
+                    let n = buf.chars().count();
+                    for i in 0..=n {
+                        let prefix: String = buf.chars().take(i).collect();
+                        let w = if self.mask { self.measure_raw(&"•".repeat(i), 12.5, false) } else { self.measure_raw(&prefix, 12.5, false) };
+                        if (w - want).abs() < best.0 {
+                            best = ((w - want).abs(), i);
+                        }
+                    }
+                    *self.edit_cur = best.1;
+                    *self.edit_sel = None;
+                }
             } else if !hov && active {
                 if let Some((_, buf)) = self.edit.take() {
                     changed |= buf != *value;
@@ -390,12 +513,28 @@ impl<'a> Ui<'a> {
             self.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 8.0, self.accent, 0.55);
         }
         self.fill(r, 7.0, self.ink, if active || hov { 0.12 } else { 0.07 });
-        let hide = |s: &str| if self.mask { "•".repeat(s.chars().count()) } else { s.to_string() };
-        let shown = match (active, self.edit.as_ref()) {
-            (true, Some((_, buf))) => format!("{}|", hide(buf)),
-            _ => hide(value),
-        };
-        self.text_raw(r[0] + 9.0, r[1] + r[3] / 2.0 + 4.5, &shown, 12.5, false, self.ink, 0.95, Align::Left);
+        let hide = |s: &str, mask: bool| if mask { "•".repeat(s.chars().count()) } else { s.to_string() };
+        let mask = self.mask;
+        match (active, self.edit.clone()) {
+            (true, Some((_, buf))) => {
+                let len = buf.chars().count();
+                let cur = (*self.edit_cur).min(len);
+                let before = |n: usize| -> String { hide(&buf.chars().take(n).collect::<String>(), mask) };
+                let x0 = r[0] + 9.0;
+                // the selection, then the text, then the caret
+                if let Some(a) = *self.edit_sel {
+                    let (lo, hi) = (a.min(cur), a.max(cur).min(len));
+                    if lo != hi {
+                        let (xa, xb) = (x0 + self.measure_raw(&before(lo), 12.5, false), x0 + self.measure_raw(&before(hi), 12.5, false));
+                        self.fill([xa, r[1] + 4.0, xb - xa, r[3] - 8.0], 3.0, self.accent, 0.4);
+                    }
+                }
+                self.text_raw(x0, r[1] + r[3] / 2.0 + 4.5, &hide(&buf, mask), 12.5, false, self.ink, 0.95, Align::Left);
+                let cx = x0 + self.measure_raw(&before(cur), 12.5, false);
+                self.fill([cx, r[1] + 5.0, 1.5, r[3] - 10.0], 0.0, self.ink, 0.9);
+            }
+            _ => self.text_raw(r[0] + 9.0, r[1] + r[3] / 2.0 + 4.5, &hide(value, mask), 12.5, false, self.ink, 0.95, Align::Left),
+        }
         if changed {
             self.changed = true;
         }
@@ -643,5 +782,82 @@ pub fn fmt_num(v: f32) -> String {
         format!("{:.0}", v)
     } else {
         format!("{:.2}", v)
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn editing(text: &str) -> State {
+        let mut st = State::default();
+        st.begin_edit("f", text);
+        st
+    }
+
+    fn typed(st: &mut State, s: &str) {
+        for c in s.chars() {
+            st.key(Key::Char(c), KeyMods::default());
+        }
+    }
+
+    fn ctrl() -> KeyMods {
+        KeyMods { ctrl: true, ..KeyMods::default() }
+    }
+
+    #[test]
+    fn typing_replaces_the_selected_text_and_backspace_erases() {
+        let mut st = editing("photo.png");
+        // begin_edit selects everything
+        typed(&mut st, "ab");
+        assert_eq!(st.edit.as_ref().unwrap().1, "ab");
+        st.key(Key::Backspace, KeyMods::default());
+        assert_eq!(st.edit.as_ref().unwrap().1, "a");
+        st.key(Key::Backspace, KeyMods::default());
+        st.key(Key::Backspace, KeyMods::default());
+        assert_eq!(st.edit.as_ref().unwrap().1, "");
+    }
+
+    #[test]
+    fn the_caret_moves_and_inserts_in_the_middle() {
+        let mut st = editing("ac");
+        st.key(Key::Home, KeyMods::default());
+        st.key(Key::Right, KeyMods::default());
+        typed(&mut st, "b");
+        assert_eq!(st.edit.as_ref().unwrap().1, "abc");
+        st.key(Key::Delete, KeyMods::default());
+        assert_eq!(st.edit.as_ref().unwrap().1, "ab");
+        st.key(Key::End, KeyMods::default());
+        typed(&mut st, "ї");
+        assert_eq!(st.edit.as_ref().unwrap().1, "abї", "letters outside ASCII work");
+    }
+
+    #[test]
+    fn ctrl_a_c_x_v_use_the_clipboard() {
+        let mut st = editing("hello world");
+        st.key(Key::Char('a'), ctrl());
+        st.key(Key::Char('c'), ctrl());
+        assert_eq!(st.clip_out.take().as_deref(), Some("hello world"));
+        st.key(Key::Char('x'), ctrl());
+        assert_eq!(st.clip_out.take().as_deref(), Some("hello world"));
+        assert_eq!(st.edit.as_ref().unwrap().1, "");
+        st.key(Key::Char('v'), ctrl());
+        assert!(st.want_paste);
+        assert!(st.insert_text("pasted\ntext"));
+        assert_eq!(st.edit.as_ref().unwrap().1, "pasted text");
+        // Ctrl+Backspace takes a word
+        st.key(Key::Backspace, ctrl());
+        assert_eq!(st.edit.as_ref().unwrap().1, "pasted ");
+    }
+
+    #[test]
+    fn shift_arrows_select_and_typing_replaces() {
+        let mut st = editing("abcd");
+        st.key(Key::End, KeyMods::default());
+        let shift = KeyMods { shift: true, ..KeyMods::default() };
+        st.key(Key::Left, shift);
+        st.key(Key::Left, shift);
+        typed(&mut st, "X");
+        assert_eq!(st.edit.as_ref().unwrap().1, "abX");
     }
 }

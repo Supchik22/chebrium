@@ -120,6 +120,24 @@ pub fn titlebar(ui: &mut Ui<'_>, host: &mut Host, w: f32, title: &str) -> f32 {
     h
 }
 
+/// For a program whose content runs up under the title row (a sidebar down the full height, a toolbar in the header): the
+/// window's buttons are drawn over it in the desktop's style, and a press on the bare part of the top `bar_h` px moves
+/// the window (twice maximises it). Call it last in the frame, after the widgets; `used` says one of them took the press.
+/// On a Mac-style desktop the buttons sit at the left, so keep the first 80 px of the sidebar's top clear.
+pub fn integrated(ui: &mut Ui<'_>, host: &mut Host, size: [f32; 2], bar_h: f32, used: bool) -> bool {
+    let [w, _] = size;
+    let on_button = controls(ui, host, 0.0, w, bar_h / 2.0, 1.0);
+    let bare = ui.click && !used && !on_button && ui.mouse[1] >= BORDER && ui.mouse[1] < bar_h && ui.mouse[0] >= BORDER && ui.mouse[0] < w - BORDER;
+    if bare {
+        if ui.double {
+            host.toggle_maximize = !host.fixed;
+        } else {
+            host.drag = true;
+        }
+    }
+    on_button || bare
+}
+
 /// A press on the edge or corner of the window starts a resize. Returns true when it did (the press is used up).
 pub fn resize_borders(ui: &Ui<'_>, host: &mut Host, size: [f32; 2]) -> bool {
     if !ui.click || host.maximized || host.fixed {

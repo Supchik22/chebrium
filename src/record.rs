@@ -20,6 +20,8 @@ pub enum Cmd {
     /// limit the commands up to the matching `PopClip` to a box
     PushClip { r: [f32; 4] },
     PopClip,
+    /// glass reads the pixels around it, so it is repainted whenever anything under or near it is
+    Glass { r: [f32; 4], radius: f32, strength: f32, dark: bool },
     /// a picture: the same one (by id) at the same place is the same command, so a still picture costs nothing to keep
     Picture { r: [f32; 4], pic: std::sync::Arc<crate::picture::Pic>, src: [f32; 4], alpha: f32 },
 }
@@ -62,6 +64,10 @@ impl Draw for Recorder<'_> {
         self.cmds.push(Cmd::Picture { r, pic: pic.clone(), src, alpha });
     }
 
+    fn glass(&mut self, r: [f32; 4], radius: f32, strength: f32, dark: bool) {
+        self.cmds.push(Cmd::Glass { r, radius, strength, dark });
+    }
+
     fn push_clip(&mut self, r: [f32; 4]) {
         self.cmds.push(Cmd::PushClip { r });
     }
@@ -89,6 +95,11 @@ fn bounds(cmd: &Cmd, gfx: &mut Gfx, s: f32) -> Box4 {
     let rect = |r: &[f32; 4]| [(r[0] * s).floor() as i32 - 2, (r[1] * s).floor() as i32 - 2, ((r[0] + r[2]) * s).ceil() as i32 + 2, ((r[1] + r[3]) * s).ceil() as i32 + 2];
     match cmd {
         Cmd::Fill { r, .. } | Cmd::Grad { r, .. } | Cmd::Picture { r, .. } => rect(r),
+        // the blur reads a margin around the panel
+        Cmd::Glass { r, .. } => {
+            let m = 12.0 * s;
+            [(r[0] * s - m).floor() as i32, (r[1] * s - m).floor() as i32, ((r[0] + r[2]) * s + m).ceil() as i32, ((r[1] + r[3]) * s + m).ceil() as i32]
+        }
         Cmd::PushClip { r } => [(r[0] * s).floor() as i32, (r[1] * s).floor() as i32, ((r[0] + r[2]) * s).ceil() as i32, ((r[1] + r[3]) * s).ceil() as i32],
         Cmd::PopClip => [0, 0, 0, 0],
         Cmd::Glyph { cx, cy, size, .. } => {
@@ -115,6 +126,7 @@ fn paint(cmd: &Cmd, d: &mut SoftDraw) {
         Cmd::Glyph { cx, cy, size, icon, c, alpha } => d.glyph(*cx, *cy, *size, icon, *c, *alpha),
         Cmd::Text { x, y, text, size, bold, c, alpha, align } => d.text(*x, *y, text, *size, *bold, *c, *alpha, *align),
         Cmd::Picture { r, pic, src, alpha } => d.picture(*r, pic, *src, *alpha),
+        Cmd::Glass { r, radius, strength, dark } => d.glass(*r, *radius, *strength, *dark),
         Cmd::PushClip { r } => d.push_clip(*r),
         Cmd::PopClip => d.pop_clip(),
     }
@@ -212,6 +224,21 @@ impl Frame {
         if damage[0] >= damage[2] || damage[1] >= damage[3] {
             self.prev = items;
             return None;
+        }
+        // glass reads pixels around it, so a panel touched by the damage is repainted whole (else its unrepainted part
+        // would be blurred twice); growing the box can reach another panel, hence the loop
+        let mut damage = damage;
+        loop {
+            let mut grown = damage;
+            for (c, b) in &items {
+                if matches!(c, Cmd::Glass { .. }) && touches(*b, damage) {
+                    grown = [grown[0].min(b[0].max(0)), grown[1].min(b[1].max(0)), grown[2].max(b[2].min(self.w as i32)), grown[3].max(b[3].min(self.h as i32))];
+                }
+            }
+            if grown == damage {
+                break;
+            }
+            damage = grown;
         }
         let mut canvas = Canvas::new(&mut self.data, self.w, self.h);
         canvas.clear_rect(damage, bg_key.0, bg.1);
@@ -339,5 +366,29 @@ mod tests {
         let dmg = f.update(frame_of(list(true), &mut gfx), &mut gfx, BG, 1.0).expect("the row changed");
         assert!(dmg[1] >= 40 && dmg[3] <= 100, "damage {dmg:?} is the clipped part, not the whole row");
         assert_eq!(f.data, from_scratch(frame_of(list(true), &mut gfx), &mut gfx));
+    }
+
+    #[test]
+    fn glass_over_a_changing_backdrop_diffs_exactly_and_really_blurs() {
+        let mut gfx = Gfx::new();
+        let scene = |shift: f32| {
+            move |d: &mut Recorder| {
+                d.fill([0.0, 0.0, 200.0, 150.0], 0.0, [0.1, 0.1, 0.15], 1.0);
+                // hard stripes under the panel: a blur must soften them
+                for k in 0..10 {
+                    d.fill([k as f32 * 20.0 + shift, 0.0, 10.0, 150.0], 0.0, [1.0, 0.3, 0.2], 1.0);
+                }
+                d.glass([30.0, 50.0, 140.0, 40.0], 16.0, 1.0, true);
+            }
+        };
+        let mut f = Frame::default();
+        f.resize(200, 150);
+        f.update(frame_of(scene(0.0), &mut gfx), &mut gfx, BG, 1.0);
+        // a stripe moves under the panel: only part of the panel is dirty, yet the result must equal a fresh paint
+        f.update(frame_of(scene(3.0), &mut gfx), &mut gfx, BG, 1.0).expect("changed");
+        assert_eq!(f.data, from_scratch(frame_of(scene(3.0), &mut gfx), &mut gfx));
+        // inside the panel the stripes are smoothed: neighbouring pixels differ far less than the 255 step of a stripe edge
+        let (a, b) = (pixel(&f.data, 200, 98, 70), pixel(&f.data, 200, 99, 70));
+        assert!((a[2] as i32 - b[2] as i32).abs() < 20, "{a:?} {b:?}");
     }
 }

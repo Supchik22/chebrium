@@ -105,6 +105,11 @@ impl Draw for SoftDraw<'_, '_> {
         self.gfx.text_width(text, size * self.scale, bold) / self.scale
     }
 
+    fn glass(&mut self, r: [f32; 4], radius: f32, strength: f32, dark: bool) {
+        let r = self.rect(r);
+        self.canvas.glass_round_rect(r[0], r[1], r[2], r[3], radius * self.scale, dark, strength, self.scale);
+    }
+
     fn picture(&mut self, r: [f32; 4], pic: &std::sync::Arc<crate::picture::Pic>, src: [f32; 4], alpha: f32) {
         self.canvas.blit_pic(self.rect(r), pic, src, alpha);
     }

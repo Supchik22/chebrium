@@ -7,6 +7,8 @@ file manager.
 Chebrium draws with a tiny anti-aliased **software** painter into a shared-memory buffer. There is no GPU context, no
 widget tree and no retained state beyond what a program keeps itself, and a program that is not moving draws nothing.
 
+See [docs/DEVELOPING.md](docs/DEVELOPING.md) for the working reference (API cheat sheet, input model, testing, build recipes).
+
 ## Principles
 
 - **Light by construction.** A window is one `wl_shm` buffer. Text lines and icons are rasterised once and cached.
