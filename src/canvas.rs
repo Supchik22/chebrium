@@ -28,7 +28,14 @@ pub struct Canvas<'a> {
 fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
     let qx = (px - cx).abs() - hw + r;
     let qy = (py - cy).abs() - hh + r;
-    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+    // Only inside a corner's square are both positive and the distance is a real hypotenuse. Everywhere else the
+    // textbook formula `max(q, 0).hypot(..) + min(max(qx, qy), 0) - r` reduces exactly to `max(qx, qy) - r`
+    // (hypot of a value and zero is that value, adding zero changes nothing), so the same result costs no hypot call.
+    if qx > 0.0 && qy > 0.0 {
+        qx.hypot(qy) - r
+    } else {
+        qx.max(qy) - r
+    }
 }
 
 impl<'a> Canvas<'a> {
@@ -47,12 +54,14 @@ impl<'a> Canvas<'a> {
 
     /// Paint over the box `r` (x0, y0, x1, y1) with a solid colour, replacing what was there.
     pub fn clear_rect(&mut self, r: [i32; 4], c: Rgb, a: f32) {
-        let px = [(c[2] as f32 * a + 0.5) as u8, (c[1] as f32 * a + 0.5) as u8, (c[0] as f32 * a + 0.5) as u8, (a * 255.0 + 0.5) as u8];
+        self.clear_rect_to(r, clear_pixel(c, a));
+    }
+
+    /// Set the box `r` (x0, y0, x1, y1) to one premultiplied B,G,R,A pixel.
+    pub(crate) fn clear_rect_to(&mut self, r: [i32; 4], px: [u8; 4]) {
         let (x0, x1) = (r[0].max(0) as usize, (r[2].max(0) as usize).min(self.w));
         for y in (r[1].max(0) as usize)..(r[3].max(0) as usize).min(self.h) {
-            for p in self.data[(y * self.w + x0) * 4..(y * self.w + x1.max(x0)) * 4].chunks_exact_mut(4) {
-                p.copy_from_slice(&px);
-            }
+            fill_pixels(&mut self.data[(y * self.w + x0) * 4..(y * self.w + x1.max(x0)) * 4], px);
         }
     }
 
@@ -74,9 +83,7 @@ impl<'a> Canvas<'a> {
 
     pub fn clear(&mut self, c: Rgb, a: f32) {
         let px = [(c[2] as f32 * a + 0.5) as u8, (c[1] as f32 * a + 0.5) as u8, (c[0] as f32 * a + 0.5) as u8, (a * 255.0 + 0.5) as u8];
-        for chunk in self.data.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&px);
-        }
+        fill_pixels(self.data, px);
     }
 
     pub fn fill_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: Rgb, a: f32) {
@@ -104,10 +111,7 @@ impl<'a> Canvas<'a> {
             let mut px = start;
             if mx0 < mx1 {
                 // the part before the span, the span, then the part after it
-                while px < mx0.min(end) {
-                    self.edge_pixel(px, py, cx, cy, hw, hh, r, c, a);
-                    px += 1;
-                }
+                self.edge_run(px, mx0.min(end), py, cx, cy, hw, hh, r, c, a);
                 let d = sd_round_rect(mx0 as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r);
                 let row_a = a * (0.5 - d).clamp(0.0, 1.0);
                 if row_a > 0.0 {
@@ -115,10 +119,40 @@ impl<'a> Canvas<'a> {
                 }
                 px = px.max(mx1);
             }
-            while px < end {
-                self.edge_pixel(px, py, cx, cy, hw, hh, r, c, a);
-                px += 1;
+            self.edge_run(px, end, py, cx, cy, hw, hh, r, c, a);
+        }
+    }
+
+    /// The pixels `x0..x1` of row `py` outside the flat span: each through `edge_pixel`, except those the row's
+    /// geometry shows to be surely inside the shape (full coverage: blended as they are, no distance needed) or surely
+    /// outside it (skipped). A round button is nearly all such pixels, and the distance (a `hypot` each) was most of
+    /// its cost. The margin keeps every pixel near the outline on the exact path, so the bytes do not change.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn edge_run(&mut self, x0: i32, x1: i32, py: i32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32, c: Rgb, a: f32) {
+        if x0 >= x1 {
+            return;
+        }
+        let (inner, outer) = row_limits(py as f32 + 0.5, cy, hw, hh, r);
+        // pixels with full coverage come in one stretch: they are blended together (`blend_span_float` does what
+        // `blend` does to each, byte for byte)
+        let row = py as usize * self.w;
+        let mut run: Option<i32> = None;
+        for px in x0..x1 {
+            let ax = (px as f32 + 0.5 - cx).abs();
+            if ax <= inner && ax < outer {
+                run.get_or_insert(px);
+                continue;
             }
+            if let Some(from) = run.take() {
+                blend_span_float(&mut self.data[(row + from as usize) * 4..(row + px as usize) * 4], c, a);
+            }
+            if ax < outer {
+                self.edge_pixel(px, py, cx, cy, hw, hh, r, c, a);
+            }
+        }
+        if let Some(from) = run {
+            blend_span_float(&mut self.data[(row + from as usize) * 4..(row + x1 as usize) * 4], c, a);
         }
     }
 
@@ -138,20 +172,11 @@ impl<'a> Canvas<'a> {
         let row = y as usize * self.w;
         let pixels = &mut self.data[(row + x0 as usize) * 4..(row + x1 as usize) * 4];
         if a >= 0.999 {
-            let px = [c[2], c[1], c[0], 255];
-            for p in pixels.chunks_exact_mut(4) {
-                p.copy_from_slice(&px);
-            }
+            fill_pixels(pixels, [c[2], c[1], c[0], 255]);
             return;
         }
         let ia = (a.clamp(0.0, 1.0) * 256.0) as u32;
-        let inv = 256 - ia;
-        let src = [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia];
-        for p in pixels.chunks_exact_mut(4) {
-            for k in 0..4 {
-                p[k] = ((src[k] + p[k] as u32 * inv) >> 8) as u8;
-            }
-        }
+        blend_span(pixels, [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia], (256 - ia) as u16);
     }
 
     /// Anti-aliased outline of width `t`, drawn inside the shape.
@@ -175,16 +200,28 @@ impl<'a> Canvas<'a> {
         let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
         let r = r.min(hw).min(hh);
         let clip = self.clip;
+        // as in `fill_round_rect`: between the corner zones the coverage is the same along a row, and so is the colour
+        // (the gradient is vertical), so that stretch is blended with one alpha; the result is the same as pixel by pixel
+        let m = r.max(1.0);
+        let mx0 = ((cx - hw + m).ceil() as i32).max(clip[0]);
+        let mx1 = ((cx + hw - m).floor() as i32).min(clip[2]);
+        let start = (x.floor() as i32).max(clip[0]);
+        let end = ((x + w).ceil() as i32).min(clip[2]);
         for py in (y.floor() as i32).max(clip[1])..((y + h).ceil() as i32).min(clip[3]) {
             let t = ((py as f32 + 0.5 - y) / h.max(1.0)).clamp(0.0, 1.0);
             let c = [0, 1, 2].map(|i| (top[i] as f32 + (bottom[i] as f32 - top[i] as f32) * t + 0.5) as u8);
-            for px in (x.floor() as i32).max(clip[0])..((x + w).ceil() as i32).min(clip[2]) {
-                let d = sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r);
+            let mut px = start;
+            if mx0 < mx1 {
+                self.edge_run(px, mx0.min(end), py, cx, cy, hw, hh, r, c, a);
+                let d = sd_round_rect(mx0 as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r);
                 let cov = (0.5 - d).clamp(0.0, 1.0);
                 if cov > 0.0 {
-                    self.blend(px, py, c, a * cov);
+                    let row = py as usize * self.w;
+                    blend_span_float(&mut self.data[(row + mx0 as usize) * 4..(row + mx1 as usize) * 4], c, a * cov);
                 }
+                px = px.max(mx1);
             }
+            self.edge_run(px, end, py, cx, cy, hw, hh, r, c, a);
         }
     }
 
@@ -196,24 +233,25 @@ impl<'a> Canvas<'a> {
         }
         let (cr, cg, cb) = (c[0] as u32, c[1] as u32, c[2] as u32);
         let clip = self.clip;
+        // the columns inside the clip, worked out once instead of tested pixel by pixel
+        let (c0, c1) = ((clip[0] - x).clamp(0, w as i32) as usize, (clip[2] - x).clamp(0, w as i32) as usize);
+        if c0 >= c1 {
+            return;
+        }
         for row in 0..h {
             let dy = y + row as i32;
             if dy < clip[1] || dy >= clip[3] {
                 continue;
             }
-            for col in 0..w {
-                let k = cov[row * w + col] as u32;
+            let src = &cov[row * w + c0..row * w + c1];
+            let o = (dy as usize * self.w + (x + c0 as i32) as usize) * 4;
+            let dst = &mut self.data[o..o + (c1 - c0) * 4];
+            for (&k, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
                 if k == 0 {
                     continue;
                 }
-                let dx = x + col as i32;
-                if dx < clip[0] || dx >= clip[2] {
-                    continue;
-                }
-                let a8 = ((k * ia) >> 8).min(255);
+                let a8 = ((k as u32 * ia) >> 8).min(255);
                 let inv = 255 - a8;
-                let o = (dy as usize * self.w + dx as usize) * 4;
-                let d = &mut self.data[o..o + 4];
                 d[0] = ((cb * a8 + d[0] as u32 * inv + 127) / 255) as u8;
                 d[1] = ((cg * a8 + d[1] as u32 * inv + 127) / 255) as u8;
                 d[2] = ((cr * a8 + d[2] as u32 * inv + 127) / 255) as u8;
@@ -228,17 +266,18 @@ impl<'a> Canvas<'a> {
 
     /// Blit a premultiplied RGBA8 bitmap (e.g. a rasterised Lucide icon) with its top-left at (x, y).
     pub fn blit_premul(&mut self, x: i32, y: i32, w: usize, h: usize, data: &[u8], alpha: f32) {
-        for row in 0..h {
-            for col in 0..w {
+        // the rows and columns inside the clip, worked out once
+        let clip = self.clip;
+        let (c0, c1) = ((clip[0] - x).clamp(0, w as i32) as usize, (clip[2] - x).clamp(0, w as i32) as usize);
+        let (r0, r1) = ((clip[1] - y).clamp(0, h as i32) as usize, (clip[3] - y).clamp(0, h as i32) as usize);
+        for row in r0..r1 {
+            for col in c0..c1 {
                 let i = (row * w + col) * 4;
                 let sa = data[i + 3] as f32 / 255.0 * alpha;
                 if sa <= 0.0 {
                     continue;
                 }
                 let (dx, dy) = (x + col as i32, y + row as i32);
-                if dx < self.clip[0] || dy < self.clip[1] || dx >= self.clip[2] || dy >= self.clip[3] {
-                    continue;
-                }
                 let o = (dy as usize * self.w + dx as usize) * 4;
                 let inv = 1.0 - sa;
                 let d = &mut self.data[o..o + 4];
@@ -648,6 +687,327 @@ fn box_blur(src: &[[f32; 4]], dst: &mut [[f32; 4]], w: usize, h: usize, r: usize
             let (add, sub) = (at((i + r + 1) as isize), at(i as isize - r as isize));
             for k in 0..4 {
                 sum[k] += add[k] - sub[k];
+            }
+        }
+    }
+}
+
+/// The part of the box `area` (x0, y0, x1, y1) where `Canvas::fill_round_rect` paints every pixel with one alpha: the
+/// columns `x0..x1` returned, over all of the area's rows, away from the shape's rounded ends, with the same coverage on
+/// every row. `None` when there is no such part (the area reaches past the shape's top or bottom, or into a corner).
+///
+/// What for: a repaint of a damaged box clears it to the background and then covers it with a translucent pane (the
+/// content pane under a list being scrolled). Where the pane is flat, the result is one colour, worked out once (see
+/// `flat_pixel`) and cleared straight in: the pixels are written once instead of once per pane, with the same bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flat_part(x: f32, y: f32, w: f32, h: f32, r: f32, a: f32, area: [i32; 4]) -> Option<(i32, i32, f32)> {
+    let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+    let r = r.min(hw).min(hh);
+    let m = r.max(1.0);
+    // the same span as `fill_round_rect` works out, with the area as the clip
+    let mx0 = ((cx - hw + m).ceil() as i32).max(area[0]);
+    let mx1 = ((cx + hw - m).floor() as i32).min(area[2]);
+    if mx0 >= mx1 || (y.floor() as i32) > area[1] || ((y + h).ceil() as i32) < area[3] || area[1] >= area[3] {
+        return None;
+    }
+    // inside the span a row's coverage does not depend on the column, so it is taken where `fill_round_rect` takes it
+    let row_a = |py: i32| a * (0.5 - sd_round_rect(mx0 as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r)).clamp(0.0, 1.0);
+    let first = row_a(area[1]);
+    if (area[1] + 1..area[3]).any(|py| row_a(py).to_bits() != first.to_bits()) {
+        return None;
+    }
+    Some((mx0, mx1, first))
+}
+
+/// One pixel of a span `fill_round_rect` paints with alpha `row_a` (from `flat_part`) over `under`, through the very
+/// code a row goes through.
+pub(crate) fn flat_pixel(c: Rgb, row_a: f32, under: [u8; 4]) -> [u8; 4] {
+    let mut px = under;
+    if row_a > 0.0 {
+        if row_a >= 0.999 {
+            fill_pixels(&mut px, [c[2], c[1], c[0], 255]);
+        } else {
+            let ia = (row_a.clamp(0.0, 1.0) * 256.0) as u32;
+            blend_span(&mut px, [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia], (256 - ia) as u16);
+        }
+    }
+    px
+}
+
+/// The pixel `Canvas::clear_rect` writes.
+pub(crate) fn clear_pixel(c: Rgb, a: f32) -> [u8; 4] {
+    [(c[2] as f32 * a + 0.5) as u8, (c[1] as f32 * a + 0.5) as u8, (c[0] as f32 * a + 0.5) as u8, (a * 255.0 + 0.5) as u8]
+}
+
+/// For a row through `fy` (pixel centre) of a rounded rectangle centred at `cy`: how far from the centre column a pixel
+/// centre may be and surely have full coverage (`inner`), and from how far it surely has none (`outer`), measured as
+/// `|x - cx|`. Worked out from the same distance `sd_round_rect` gives (coverage is 1 where it is at most -0.5 and 0
+/// where it is at least 0.5), pulled in by a margin far wider than any rounding, so a pixel near the outline is left
+/// to the exact test.
+fn row_limits(fy: f32, cy: f32, hw: f32, hh: f32, r: f32) -> (f32, f32) {
+    const MARGIN: f32 = 0.01;
+    let qy = (fy - cy).abs() - hh + r;
+    let base = hw - r;
+    let (lin, lout) = (r - 0.5, r + 0.5);
+    let inner = if qy > 0.0 {
+        if qy < lin - MARGIN {
+            base + (lin * lin - qy * qy).sqrt() - MARGIN
+        } else {
+            f32::NEG_INFINITY
+        }
+    } else if qy <= lin - MARGIN {
+        base + lin - MARGIN
+    } else {
+        f32::NEG_INFINITY
+    };
+    let outer = if qy > 0.0 {
+        if qy >= lout + MARGIN {
+            // the whole row is above or below the shape
+            f32::NEG_INFINITY
+        } else {
+            base + (lout * lout - qy * qy).max(0.0).sqrt() + MARGIN
+        }
+    } else {
+        base + lout + MARGIN
+    };
+    (inner, outer)
+}
+
+/// Set every pixel of `pixels` (whole B,G,R,A quadruples) to `px`. Writing 64 bytes at a time lets the compiler use wide
+/// stores; this is what clearing a damaged box and painting an opaque panel spend their time on.
+#[inline]
+fn fill_pixels(pixels: &mut [u8], px: [u8; 4]) {
+    let mut pattern = [0u8; 64];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = px[i & 3];
+    }
+    let mut chunks = pixels.chunks_exact_mut(64);
+    for ch in &mut chunks {
+        ch.copy_from_slice(&pattern);
+    }
+    let rest = chunks.into_remainder();
+    let n = rest.len();
+    rest.copy_from_slice(&pattern[..n]);
+}
+
+/// Source-over of one colour onto a run of pixels: every byte becomes `(src + dst * inv) >> 8`, where `src` is the
+/// colour already multiplied by the alpha (each at most 255 * 256) and `inv` is 256 minus the alpha (at most 256).
+///
+/// The sum needs 17 bits, but it can be split into 16-bit pieces with the same result:
+/// `(s + t) >> 8 == (s >> 8) + (t >> 8) + (((s & 255) + (t & 255)) >> 8)`. In 16-bit lanes the compiler turns the loop
+/// into eight-wide multiplies (plain SSE2), several times faster than byte by byte, and every pixel is bit-identical to
+/// the 32-bit formula.
+#[inline]
+fn blend_span(pixels: &mut [u8], src: [u32; 4], inv: u16) {
+    const N: usize = 32;
+    let mut hi = [0u16; N];
+    let mut lo = [0u16; N];
+    for i in 0..N {
+        hi[i] = (src[i & 3] >> 8) as u16;
+        lo[i] = (src[i & 3] & 255) as u16;
+    }
+    let one = |d: &mut u8, hi: u16, lo: u16| {
+        let t = *d as u16 * inv;
+        *d = (hi + (t >> 8) + ((lo + (t & 255)) >> 8)) as u8;
+    };
+    let mut chunks = pixels.chunks_exact_mut(N);
+    for ch in &mut chunks {
+        for i in 0..N {
+            one(&mut ch[i], hi[i], lo[i]);
+        }
+    }
+    for (i, d) in chunks.into_remainder().iter_mut().enumerate() {
+        one(d, hi[i], lo[i]);
+    }
+}
+
+/// `blend` for a run of pixels that share colour and alpha: the same floating-point steps in the same order, so the bytes
+/// are identical, without the per-pixel clip test and index arithmetic.
+#[inline]
+fn blend_span_float(pixels: &mut [u8], c: Rgb, a: f32) {
+    if a <= 0.0 {
+        return;
+    }
+    let a = a.min(1.0);
+    let inv = 1.0 - a;
+    let s = [c[2] as f32 * a, c[1] as f32 * a, c[0] as f32 * a, 255.0 * a];
+    for p in pixels.chunks_exact_mut(4) {
+        for k in 0..4 {
+            p[k] = (s[k] + p[k] as f32 * inv + 0.5) as u8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+
+    /// A backdrop with every kind of byte value, so a rounding difference would show.
+    fn noise(w: usize, h: usize) -> Vec<u8> {
+        let mut x = 0x1234_5678u32;
+        (0..w * h * 4)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The distance as it was written before the fast path.
+    fn sd_reference(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+        let qx = (px - cx).abs() - hw + r;
+        let qy = (py - cy).abs() - hh + r;
+        qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+    }
+
+    #[test]
+    fn the_distance_without_hypot_is_the_same_number() {
+        for i in 0..4000 {
+            let (px, py) = ((i % 97) as f32 * 0.73 - 5.0, (i / 97) as f32 * 1.31 - 3.0);
+            for (hw, hh, r) in [(20.0, 10.0, 6.0), (30.5, 30.5, 30.5), (12.0, 40.0, 0.0), (8.25, 3.75, 2.5)] {
+                let (a, b) = (sd_round_rect(px, py, 25.0, 20.0, hw, hh, r), sd_reference(px, py, 25.0, 20.0, hw, hh, r));
+                assert_eq!(a, b, "{px},{py} {hw},{hh},{r}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_wide_span_blend_matches_the_byte_formula() {
+        for a in [0.001f32, 0.06, 0.2, 0.5, 0.73, 0.98] {
+            let c = [200u8, 31, 117];
+            let mut fast = noise(37, 1);
+            let mut slow = fast.clone();
+            let ia = (a * 256.0) as u32;
+            blend_span(&mut fast, [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia], (256 - ia) as u16);
+            let src = [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia];
+            for p in slow.chunks_exact_mut(4) {
+                for k in 0..4 {
+                    p[k] = ((src[k] + p[k] as u32 * (256 - ia)) >> 8) as u8;
+                }
+            }
+            assert_eq!(fast, slow, "alpha {a}");
+        }
+    }
+
+    #[test]
+    fn the_gradient_with_row_spans_matches_pixel_by_pixel() {
+        let (w, h) = (90, 70);
+        for (rect, r, a) in [([3.3f32, 4.6, 80.0, 60.0], 12.0f32, 0.8f32), ([10.0, 10.0, 50.0, 20.0], 10.0, 1.0), ([0.5, 0.5, 70.0, 40.0], 0.0, 0.35), ([20.4, 3.1, 55.5, 55.5], 27.75, 0.95)] {
+            let mut fast = noise(w, h);
+            let mut slow = fast.clone();
+            let (top, bottom) = ([250, 20, 90], [10, 200, 140]);
+            let mut cv = Canvas::new(&mut fast, w, h);
+            cv.set_clip([2, 0, 85, 66]);
+            cv.fill_round_rect_grad(rect[0], rect[1], rect[2], rect[3], r, top, bottom, a);
+            // the old loop: every pixel through `blend`
+            let mut cv = Canvas::new(&mut slow, w, h);
+            cv.set_clip([2, 0, 85, 66]);
+            let [x, y, rw, rh] = rect;
+            let (cx, cy, hw, hh) = (x + rw / 2.0, y + rh / 2.0, rw / 2.0, rh / 2.0);
+            let r = r.min(hw).min(hh);
+            let clip = cv.clip;
+            for py in (y.floor() as i32).max(clip[1])..((y + rh).ceil() as i32).min(clip[3]) {
+                let t = ((py as f32 + 0.5 - y) / rh.max(1.0)).clamp(0.0, 1.0);
+                let c = [0, 1, 2].map(|i| (top[i] as f32 + (bottom[i] as f32 - top[i] as f32) * t + 0.5) as u8);
+                for px in (x.floor() as i32).max(clip[0])..((x + rw).ceil() as i32).min(clip[2]) {
+                    let cov = (0.5 - sd_reference(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r)).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        cv.blend(px, py, c, a * cov);
+                    }
+                }
+            }
+            assert!(fast == slow, "rect {rect:?} radius {r}");
+        }
+    }
+
+    /// `fill_round_rect` as it was: every pixel outside the flat span through the full distance.
+    fn fill_reference(cv: &mut Canvas, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgb, a: f32) {
+        let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+        let r = r.min(hw).min(hh);
+        let m = r.max(1.0);
+        let clip = cv.clip;
+        let mx0 = ((cx - hw + m).ceil() as i32).max(clip[0]);
+        let mx1 = ((cx + hw - m).floor() as i32).min(clip[2]);
+        let start = (x.floor() as i32).max(clip[0]);
+        let end = ((x + w).ceil() as i32).min(clip[2]);
+        let edge = |cv: &mut Canvas, px: i32, py: i32| {
+            let cov = (0.5 - sd_reference(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r)).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                cv.blend(px, py, c, a * cov);
+            }
+        };
+        for py in (y.floor() as i32).max(clip[1])..((y + h).ceil() as i32).min(clip[3]) {
+            let mut px = start;
+            if mx0 < mx1 {
+                while px < mx0.min(end) {
+                    edge(cv, px, py);
+                    px += 1;
+                }
+                let row_a = a * (0.5 - sd_reference(mx0 as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, r)).clamp(0.0, 1.0);
+                if row_a > 0.0 {
+                    let ia = (row_a.clamp(0.0, 1.0) * 256.0) as u32;
+                    for qx in mx0..mx1 {
+                        let o = (py as usize * cv.w + qx as usize) * 4;
+                        let src = [c[2] as u32 * ia, c[1] as u32 * ia, c[0] as u32 * ia, 255 * ia];
+                        for k in 0..4 {
+                            cv.data[o + k] = if row_a >= 0.999 { [c[2], c[1], c[0], 255][k] } else { ((src[k] + cv.data[o + k] as u32 * (256 - ia)) >> 8) as u8 };
+                        }
+                    }
+                }
+                px = px.max(mx1);
+            }
+            while px < end {
+                edge(cv, px, py);
+                px += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn round_shapes_skip_the_distance_and_keep_every_byte() {
+        let (w, h) = (120, 90);
+        let shapes = [
+            ([10.0f32, 10.0, 60.0, 60.0], 30.0f32, 1.0f32),
+            ([13.3, 7.7, 61.4, 61.4], 30.7, 0.73),
+            ([2.5, 20.25, 100.0, 34.0], 17.0, 0.5),
+            ([30.0, 30.0, 20.0, 9.0], 3.0, 0.9),
+            ([5.6, 5.6, 80.0, 70.0], 0.0, 0.42),
+            ([40.1, 3.9, 7.0, 7.0], 0.4, 1.0),
+            ([-20.0, -15.0, 90.0, 70.0], 24.0, 0.66),
+        ];
+        for (rect, r, a) in shapes {
+            for clip in [[0, 0, w as i32, h as i32], [17, 11, 77, 59]] {
+                let mut fast = noise(w, h);
+                let mut slow = fast.clone();
+                let mut cv = Canvas::new(&mut fast, w, h);
+                cv.set_clip(clip);
+                cv.fill_round_rect(rect[0], rect[1], rect[2], rect[3], r, [30, 140, 250], a);
+                let mut cv = Canvas::new(&mut slow, w, h);
+                cv.set_clip(clip);
+                fill_reference(&mut cv, rect[0], rect[1], rect[2], rect[3], r, [30, 140, 250], a);
+                assert!(fast == slow, "rect {rect:?} radius {r} alpha {a} clip {clip:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_blit_respects_the_clip_on_both_sides() {
+        let (w, h) = (40, 20);
+        let cov: Vec<u8> = (0..30 * 10).map(|i| (i * 7 % 256) as u8).collect();
+        let mut buf = noise(w, h);
+        let before = buf.clone();
+        let mut cv = Canvas::new(&mut buf, w, h);
+        cv.set_clip([10, 5, 25, 12]);
+        cv.blit_coverage(-3, 2, 30, 10, &cov, [255, 255, 255], 1.0);
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let inside = (10..25).contains(&x) && (5..12).contains(&y);
+                if !inside {
+                    assert_eq!(buf[o..o + 4], before[o..o + 4], "{x},{y} is outside the clip");
+                }
             }
         }
     }

@@ -327,6 +327,26 @@ impl<'a> Ui<'a> {
         self.anim.set(key, value);
     }
 
+    /// A value a widget keeps under `key` (set with `snap`, or the current point of an `ease`).
+    pub fn recall(&self, key: u64) -> Option<f32> {
+        self.anim.get(key)
+    }
+
+    /// A drag of a widget's own (a scrollbar's thumb): a press on `hot` makes `key` the thing being dragged, so no other
+    /// control takes the pointer, and this is true for as long as the button stays down. `key` must not clash with the
+    /// small numbers `id` hands out (use high bits).
+    pub fn grab(&mut self, key: u64, hot: [f32; 4]) -> bool {
+        if self.click && self.hit(hot) {
+            *self.drag = Some(key);
+        }
+        self.held && *self.drag == Some(key)
+    }
+
+    /// Is the widget under `key` being dragged right now (see `grab`)?
+    pub fn grabbed(&self, key: u64) -> bool {
+        self.held && *self.drag == Some(key)
+    }
+
     pub fn id(&mut self) -> u64 {
         self.next += 1;
         self.next
@@ -638,21 +658,31 @@ impl<'a> Ui<'a> {
     /// A round domed knob with a pale ring and a shadow, like the keys of the calculator (`c` its centre, `d` its width);
     /// a flat disc when the controls are flat.
     fn knob(&mut self, c: [f32; 2], d: f32, wash: f32) {
+        self.knob_wh(c, d, d, wash);
+    }
+
+    /// A knob `w` wide and `h` tall: a disc when they are equal, a squashed pill when it is wider (slim controls).
+    fn knob_wh(&mut self, c: [f32; 2], w: f32, h: f32, wash: f32) {
+        let r = [c[0] - w / 2.0, c[1] - h / 2.0, w, h];
         if self.flat() {
-            let rad = self.controls.radius(d / 2.0);
-            self.fill([c[0] - d / 2.0, c[1] - d / 2.0, d, d], rad, [0.0; 3], 0.18);
-            self.fill([c[0] - d / 2.0 + 1.0, c[1] - d / 2.0 + 1.0, d - 2.0, d - 2.0], (rad - 1.0).max(0.0), [1.0; 3], 1.0);
+            let rad = self.controls.radius(h / 2.0);
+            self.fill(r, rad, [0.0; 3], 0.18);
+            self.fill([r[0] + 1.0, r[1] + 1.0, w - 2.0, h - 2.0], (rad - 1.0).max(0.0), [1.0; 3], 1.0);
             return;
         }
         let (face, ring, shadow) = if self.dark { ([0.72, 0.76, 0.82], [0.88, 0.91, 0.95], ([0.0, 0.0, 0.0], 0.42)) } else { ([0.93, 0.95, 0.97], [1.0, 1.0, 1.0], ([0.30, 0.38, 0.46], 0.30)) };
-        let w = self.ease(0x4b0b + (c[1] as u64) * 4096 + (c[0] as u64 / 64), wash, 20.0);
+        let wsh = self.ease(0x4b0b + (c[1] as u64) * 4096 + (c[0] as u64 / 64), wash, 20.0);
         let (round, depth) = (self.controls.round, self.controls.depth);
-        crate::retro::key_body_shaped(self, [c[0] - d / 2.0, c[1] - d / 2.0, d, d], face, ring, shadow, w, 0.0, round, depth);
+        crate::retro::key_body_shaped(self, r, face, ring, shadow, wsh, 0.0, round, depth);
     }
 
     pub fn toggle(&mut self, x: f32, y: f32, on: &mut bool) {
-        let r = [x, y, 44.0, 24.0];
-        let hov = self.hit(r);
+        // it takes the place of a 44 x 24 switch whatever its thickness: the track is lower when slim (centred in that
+        // place) and the knob a squashed pill
+        let hit = [x, y, 44.0, 24.0];
+        let (tw, th) = (self.controls.thick(40.0, 44.0), self.controls.thick(16.0, 24.0));
+        let r = [x + (44.0 - tw) / 2.0, y + (24.0 - th) / 2.0, tw, th];
+        let hov = self.hit(hit);
         if hov {
             self.want_cursor(Cursor::Pointer);
         }
@@ -663,15 +693,20 @@ impl<'a> Ui<'a> {
         if self.tint.is_none() {
             self.tint = Some(self.tone(crate::style::Tone::Success));
         }
-        self.groove(r, 12.0, t);
+        self.groove(r, th / 2.0, t);
         self.tint = saved;
         if self.flat() {
             // the knob stretches a little on its way over
+            let (kh, kw) = (th - 4.0, self.controls.thick(17.0, 20.0));
+            let travel = tw - 4.0 - kw;
             let stretch = 8.0 * 4.0 * t * (1.0 - t);
-            let rad = self.controls.radius(10.0);
-            self.fill([x + 2.0 + 20.0 * t - stretch * t, y + 2.0, 20.0 + stretch, 20.0], rad, [1.0; 3], 1.0);
+            let rad = self.controls.radius(kh / 2.0);
+            self.fill([r[0] + 2.0 + travel * t - stretch * t, r[1] + 2.0, kw + stretch, kh], rad, [1.0; 3], 1.0);
         } else {
-            self.knob([x + 12.0 + 20.0 * t, y + 11.0], 21.0, if hov { 1.0 } else { 0.0 });
+            let (kh, kw) = (self.controls.thick(14.0, 21.0), self.controls.thick(20.0, 21.0));
+            let travel = tw - 3.0 - kw;
+            let cy = r[1] + th / 2.0 - self.controls.thick(0.0, 1.0);
+            self.knob_wh([r[0] + 1.5 + kw / 2.0 + travel * t, cy], kw, kh, if hov { 1.0 } else { 0.0 });
         }
         if self.click && hov {
             *on = !*on;
@@ -681,6 +716,14 @@ impl<'a> Ui<'a> {
 
     /// Horizontal slider; `r` is the track area.
     pub fn slider(&mut self, r: [f32; 4], v: &mut f32, min: f32, max: f32, unit: &str) {
+        self.slider_bare(r, v, min, max);
+        let cy = r[1] + r[3] / 2.0;
+        self.text_raw(r[0] + r[2] + 18.0, cy + 4.5, &format!("{}{}", fmt_num(*v), unit), 12.0, false, self.ink, 0.7, Align::Left);
+    }
+
+    /// The slider without the number after it (a seek line, a volume): the same groove and knob. Returns true while
+    /// the knob is being dragged, so a caller can act on the release (a player seeks once the pointer lets go).
+    pub fn slider_bare(&mut self, r: [f32; 4], v: &mut f32, min: f32, max: f32) -> bool {
         let id = self.id();
         let hot = [r[0] - 6.0, r[1] - 8.0, r[2] + 12.0, r[3] + 16.0];
         if self.hit(hot) || *self.drag == Some(id) {
@@ -700,13 +743,15 @@ impl<'a> Ui<'a> {
         let t = ((*v - min) / (max - min)).clamp(0.0, 1.0);
         let cy = r[1] + r[3] / 2.0;
         // a groove with the accent filling it, and a round domed knob on the end of the fill
-        let rail = if self.flat() { 6.0 } else { 8.0 };
+        // slim: a thin rail and a knob squashed into a short pill
+        let rail = if self.flat() { self.controls.thick(3.0, 6.0) } else { self.controls.thick(4.0, 8.0) };
         self.groove([r[0], cy - rail / 2.0, r[2], rail], rail / 2.0, 0.0);
         self.groove_fill([r[0], cy - rail / 2.0, (r[2] * t).max(0.0), rail], rail / 2.0);
         let kx = r[0] + r[2] * t;
         let held = *self.drag == Some(id);
-        self.knob([kx, cy], if self.flat() { 16.0 } else { 21.0 }, if held || self.hit(hot) { 1.0 } else { 0.0 });
-        self.text_raw(r[0] + r[2] + 18.0, cy + 4.5, &format!("{}{}", fmt_num(*v), unit), 12.0, false, self.ink, 0.7, Align::Left);
+        let (kw, kh) = if self.flat() { (self.controls.thick(18.0, 16.0), self.controls.thick(11.0, 16.0)) } else { (self.controls.thick(20.0, 21.0), self.controls.thick(13.0, 21.0)) };
+        self.knob_wh([kx, cy], kw, kh, if held || self.hit(hot) { 1.0 } else { 0.0 });
+        held && self.held
     }
 
     /// Segmented control: a groove with a domed, ringed pill (like the knob of a switch) under the chosen label, which

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chebrium Design</title>
+<style>
+/* Tokens mirror Ui: ink / accent / paper. Default accent [0.23,0.55,1.0]. */
+:root{
+  --ink:28,28,32; --paper:255,255,255; --accent:59,140,255;
+  --win-r:22px; --panel-r:18px;
+  --desk1:#9db9e8; --desk2:#e7c6e8; --desk3:#f3d7b5;
+  --glass-tint:245,246,250;
+}
+:root[data-theme="dark"]{
+  --ink:240,242,246; --paper:0,0,0;
+  --desk1:#1c2540; --desk2:#2b1f3d; --desk3:#10222c;
+  --glass-tint:30,34,44;
+}
+*{box-sizing:border-box;margin:0}
+body{
+  min-height:100vh;display:grid;place-items:center;padding:24px 16px;
+  font:13.5px/1.3 "Inter",system-ui,sans-serif;color:rgb(var(--ink));
+  background:radial-gradient(circle at 20% 15%,var(--desk1),transparent 55%),
+             radial-gradient(circle at 85% 25%,var(--desk2),transparent 50%),
+             radial-gradient(circle at 50% 95%,var(--desk3),transparent 55%),
+             var(--desk1);
+}
+.window{
+  position:relative;width:min(980px,100%);height:600px;border-radius:var(--win-r);overflow:hidden;
+  background:rgba(var(--glass-tint),.55);backdrop-filter:blur(40px) saturate(1.6);
+  box-shadow:0 0 0 1px rgba(var(--ink),.12),0 30px 80px rgba(0,0,0,.28);
+  display:flex;
+}
+/* traffic lights (Mac decor) */
+.lights{position:absolute;left:18px;top:18px;display:flex;gap:8px;z-index:5}
+.lights i{width:12px;height:12px;border-radius:50%;display:block}
+.lights i:nth-child(1){background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+
+/* floating glass sidebar: inset 8, radius 18, paper .42 / .06, white rim */
+.sidebar{
+  position:absolute;left:8px;top:8px;bottom:8px;width:208px;border-radius:var(--panel-r);
+  background:rgba(var(--paper),.42);box-shadow:inset 0 1px 0 rgba(255,255,255,.7);
+  padding:48px 10px 10px;overflow:auto;
+}
+:root[data-theme="dark"] .sidebar{background:rgba(var(--paper),.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+.sidebar h6{font-size:11px;font-weight:600;opacity:.45;margin:14px 10px 4px}
+.row{display:flex;align-items:center;gap:9px;height:30px;padding:0 10px;border-radius:10px;
+  position:relative;z-index:1;cursor:default}
+.row svg{width:16px;height:16px;stroke:rgb(var(--accent));fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+/* content: one sheet of paper, full height */
+.sheet{
+  position:relative;
+  margin-left:224px;flex:1;display:flex;flex-direction:column;min-width:0;
+  background:rgba(var(--paper),.78);
+}
+:root[data-theme="dark"] .sheet{background:rgba(var(--paper),.32)}
+.toolbar{height:52px;flex:none;display:flex;align-items:center;gap:12px;padding:0 14px 0 12px}
+.pill{height:32px;border-radius:16px;background:rgba(var(--ink),.065);display:flex;align-items:center;padding:0 2px}
+.ib{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;transition:background .15s;border:0;background:none;color:inherit;cursor:pointer}
+.ib:hover{background:rgba(var(--ink),.10)}
+.ib svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.title{display:flex;align-items:baseline;gap:8px;min-width:0}
+.title b{font-size:15px;font-weight:700}
+.title span{font-size:11px;opacity:.5}
+.grow{flex:1}
+.list{padding:6px 14px;overflow:auto;flex:1;position:relative}
+.item{display:flex;align-items:center;gap:12px;height:38px;padding:0 12px;border-radius:10px;position:relative;z-index:1}
+/* one gliding highlight per list, driven by springs (JS) */
+.hl{position:absolute;left:0;top:0;border-radius:10px;pointer-events:none;opacity:0;z-index:0;will-change:transform,width,height}
+.hl.hov{background:rgba(var(--ink),.06)}
+.hl.selh{background:rgba(var(--ink),.09)}
+.list .hl.selh{background:rgba(var(--accent),.28)}
+.menu{position:absolute;right:14px;top:50px;width:190px;padding:6px;border-radius:14px;z-index:9;
+  background:rgba(var(--paper),.85);backdrop-filter:blur(30px);box-shadow:0 0 0 1px rgba(var(--ink),.1),0 12px 36px rgba(0,0,0,.25);
+  transform-origin:top right;opacity:0;pointer-events:none}
+.menu div{height:28px;line-height:28px;padding:0 10px;border-radius:8px;position:relative;z-index:1}
+.menu .del{color:#ff453a}
+.item svg{width:18px;height:18px;stroke:rgb(var(--accent));fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.item .n{flex:1}.item .m{font-size:12px;opacity:.5;width:90px;text-align:right}
+
+/* theme switch + accent picker, outside the window */
+.ctl{position:fixed;right:16px;bottom:16px;display:flex;gap:8px;align-items:center;
+  padding:6px 8px;border-radius:20px;background:rgba(var(--paper),.6);backdrop-filter:blur(20px);font-size:12px}
+.dot{width:18px;height:18px;border-radius:50%;border:2px solid rgba(255,255,255,.8);cursor:pointer;padding:0}
+.ctl button.t{border:0;background:rgba(var(--ink),.08);color:inherit;border-radius:14px;padding:5px 12px;cursor:pointer;font:inherit}
+@media(max-width:640px){.sidebar{display:none}.sheet{margin-left:0}.window{height:520px}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="home" viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h14V10"/></symbol>
+    <symbol id="doc" viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/></symbol>
+    <symbol id="img" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M21 16l-5-5-8 9"/></symbol>
+    <symbol id="dl" viewBox="0 0 24 24"><path d="M12 4v12M7 11l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+    <symbol id="back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+    <symbol id="fwd" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+    <symbol id="grid" viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></symbol>
+    <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></symbol>
+    <symbol id="more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  </defs>
+</svg>
+
+<div class="window">
+  <div class="lights"><i></i><i></i><i></i></div>
+
+  <aside class="sidebar">
+    <div class="row sel"><svg><use href="#home"/></svg>Home</div>
+    <div class="row"><svg><use href="#doc"/></svg>Documents</div>
+    <div class="row"><svg><use href="#dl"/></svg>Downloads</div>
+    <div class="row"><svg><use href="#img"/></svg>Pictures</div>
+    <h6>Places</h6>
+    <div class="row"><svg><use href="#folder"/></svg>Projects</div>
+    <div class="row"><svg><use href="#folder"/></svg>Music</div>
+    <div class="row"><svg><use href="#trash"/></svg>Trash</div>
+  </aside>
+
+  <main class="sheet">
+    <div class="toolbar">
+      <div style="width:0"></div>
+      <div class="pill"><button class="ib"><svg><use href="#back"/></svg></button><button class="ib"><svg><use href="#fwd"/></svg></button></div>
+      <div class="title"><b>Home</b><span>7 items</span></div>
+      <div class="grow"></div>
+      <div class="pill"><button class="ib"><svg><use href="#grid"/></svg></button><button class="ib"><svg><use href="#search"/></svg></button><button class="ib" id="more"><svg><use href="#more"/></svg></button></div>
+    </div>
+    <div class="list" id="list"></div>
+    <div class="menu" id="menu"><div>Open</div><div>Rename</div><div>Duplicate</div><div class="del">Move to Trash</div></div>
+  </main>
+</div>
+
+<div class="ctl">
+  <button class="t" id="theme">Dark</button>
+  <button class="dot" style="background:#3b8cff" data-a="59,140,255"></button>
+  <button class="dot" style="background:#ff5a8a" data-a="255,90,138"></button>
+  <button class="dot" style="background:#34c76a" data-a="52,199,106"></button>
+  <button class="dot" style="background:#ff9f2e" data-a="255,159,46"></button>
+</div>
+
+<script>
+/* Damped spring, same feel as chebrium::spring::Spring (stiffness, damping ratio). */
+class Spring{
+  constructor(v,k=1100,z=0.85){this.v=v;this.t=v;this.vel=0;this.k=k;this.z=z}
+  step(dt){
+    const c=2*this.z*Math.sqrt(this.k);
+    this.vel+=(this.k*(this.t-this.v)-c*this.vel)*dt;
+    this.v+=this.vel*dt;
+  }
+  get settled(){return Math.abs(this.t-this.v)<.002&&Math.abs(this.vel)<.02}
+}
+/* Single rAF loop; runs only while some spring is moving. */
+const active=new Set();let last=0,running=false;
+function kick(fn){active.add(fn);if(!running){running=true;last=performance.now();requestAnimationFrame(tick)}}
+function tick(now){
+  const dt=Math.min((now-last)/1000,1/30);last=now;
+  for(const fn of [...active]) if(fn(dt)) active.delete(fn);
+  if(active.size) requestAnimationFrame(tick); else running=false;
+}
+
+/* Pop-in: scale .92 -> 1 with slight overshoot, fade in. */
+function popIn(el,origin,k=1100,z=0.85){
+  const sp=new Spring(0,k,z);sp.t=1;
+  el.style.transformOrigin=origin||"center";
+  kick(dt=>{
+    sp.step(dt);const v=Math.min(sp.v,1.06);
+    el.style.transform=`scale(${.92+.08*v})`;el.style.opacity=Math.max(0,Math.min(1,v*1.3));
+    return sp.settled&&(el.style.transform="",el.style.opacity=1,true);
+  });
+}
+
+/* Sliding highlight: x,y,w,h on springs (2200,1.0), opacity (2400). */
+function Highlight(box,cls,rowSel){
+  const el=document.createElement("div");el.className="hl "+cls;box.prepend(el);
+  const x=new Spring(0,2200,1),y=new Spring(0,2200,1),w=new Spring(0,2200,1),h=new Spring(0,2200,1),o=new Spring(0,2400,1);
+  let placed=false;
+  const run=dt=>{
+    for(const s of [x,y,w,h,o]) s.step(dt);
+    el.style.transform=`translate(${x.v}px,${y.v}px)`;el.style.width=w.v+"px";el.style.height=h.v+"px";
+    el.style.opacity=Math.max(0,Math.min(1,o.v));
+    return [x,y,w,h,o].every(s=>s.settled);
+  };
+  return {
+    to(row){
+      x.t=row.offsetLeft;y.t=row.offsetTop;w.t=row.offsetWidth;h.t=row.offsetHeight;o.t=1;
+      if(!placed){x.v=x.t;y.v=y.t;w.v=w.t;h.v=h.t;placed=true}
+      kick(run);
+    },
+    hide(){o.t=0;kick(run)}
+  };
+}
+function SlideList(box,rowSel,selected){
+  const hov=Highlight(box,"hov"),sel=Highlight(box,"selh");
+  const rows=[...box.querySelectorAll(rowSel)];
+  rows.forEach(r=>{
+    r.addEventListener("pointerenter",()=>hov.to(r));
+    r.addEventListener("click",()=>sel.to(r));
+  });
+  box.addEventListener("pointerleave",()=>hov.hide());
+  sel.to(rows[selected]);
+  return {sel,rows};
+}
+
+/* Data */
+const items=[["folder","Documents","Today"],["folder","Downloads","Yesterday"],["folder","Projects","Mon"],["img","wallpaper.png","3.2 MB"],["doc","notes.md","4 KB"],["doc","report.pdf","1.1 MB"],["img","photo.jpg","5.6 MB"]];
+const list=document.getElementById("list");
+items.forEach(it=>{
+  const d=document.createElement("div");d.className="item";
+  d.innerHTML=`<svg><use href="#${it[0]}"/></svg><span class="n">${it[1]}</span><span class="m">${it[2]}</span>`;
+  list.appendChild(d);
+});
+
+const win=document.querySelector(".window"),menu=document.getElementById("menu");
+popIn(win,"center");
+requestAnimationFrame(()=>{
+  SlideList(document.querySelector(".sidebar"),".row",0);
+  const L=SlideList(list,".item",1);
+  /* inserts: rows pop in one after another */
+  L.rows.forEach((r,i)=>setTimeout(()=>popIn(r,"left center",1500,.8),120+i*45));
+});
+
+/* Menu: pop-in with its own spring, closes on outside click */
+let open=false;
+document.getElementById("more").onclick=e=>{
+  e.stopPropagation();open=!open;
+  menu.style.pointerEvents=open?"auto":"none";
+  if(open) popIn(menu,"top right"); else menu.style.opacity=0;
+};
+SlideList(menu,"div:not(.hl)",0).sel.hide();
+document.addEventListener("click",()=>{if(open){open=false;menu.style.pointerEvents="none";menu.style.opacity=0}});
+
+/* Theme + accent */
+const root=document.documentElement;
+function setTheme(d){root.dataset.theme=d?"dark":"light";document.getElementById("theme").textContent=d?"Light":"Dark"}
+setTheme(matchMedia("(prefers-color-scheme: dark)").matches);
+document.getElementById("theme").onclick=()=>setTheme(root.dataset.theme!=="dark");
+document.querySelectorAll(".dot").forEach(b=>b.onclick=()=>root.style.setProperty("--accent",b.dataset.a));
+</script>
+</body>
+</html>

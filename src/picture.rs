@@ -130,6 +130,35 @@ impl Pic {
     pub fn bytes(&self) -> usize {
         self.levels.iter().map(|l| l.data.len()).sum()
     }
+
+    /// How many sizes the picture is kept in (the full one and its half-size copies).
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// One size of the picture as premultiplied BGRA: (pixels, width, height). Level 0 is the full size.
+    pub fn level(&self, i: usize) -> (&[u8], u32, u32) {
+        let l = &self.levels[i];
+        (&l.data, l.w as u32, l.h as u32)
+    }
+
+    /// Every pixel is fully opaque.
+    pub fn is_opaque(&self) -> bool {
+        self.opaque
+    }
+}
+
+/// A picture the window shows on the graphics card, under the toolkit-drawn controls (see `Host::layer`).
+#[derive(Clone, Debug)]
+pub struct PictureLayer {
+    pub pic: std::sync::Arc<Pic>,
+    /// where it goes, in logical window pixels
+    pub dest: [f32; 4],
+    /// the part of the picture shown (x, y, w, h in picture pixels)
+    pub src: [f32; 4],
+    pub alpha: f32,
+    /// the opaque ground behind it, which fills the whole window
+    pub ground: [f32; 3],
 }
 
 impl Canvas<'_> {

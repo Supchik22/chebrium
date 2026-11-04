@@ -164,6 +164,8 @@ fn effective(cmds: &[Cmd], gfx: &mut Gfx, scale: f32) -> Vec<Box4> {
 pub struct Frame {
     pub w: usize,
     pub h: usize,
+    /// the pixels, when `update` keeps them here (the window runtime paints straight into its buffers instead, see
+    /// `update_into`, and leaves this empty)
     pub data: Vec<u8>,
     /// the last frame's commands, each with the box it could change
     prev: Vec<(Cmd, Box4)>,
@@ -178,7 +180,8 @@ impl Frame {
         if (w, h) != (self.w, self.h) {
             self.w = w;
             self.h = h;
-            self.data = vec![0; w * h * 4];
+            // made when `update` needs it: a runtime that paints into its own buffers never does
+            self.data = Vec::new();
             self.prev.clear();
             self.valid = false;
         }
@@ -189,15 +192,38 @@ impl Frame {
         self.valid = false;
     }
 
-    /// Bring the pixels up to date with `cmds`. Returns the box that changed (x0, y0, x1, y1), or `None` when the
-    /// frame is the same as the last one and there is nothing to show.
+    /// The pixels hold the last frame (false after `invalidate`, a new size, or a buffer `update_into` could not get).
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Bring the pixels up to date with `cmds`. Returns the box that changed (x0, y0, x1, y1; all the boxes repainted
+    /// together), or `None` when the frame is the same as the last one and there is nothing to show.
     pub fn update(&mut self, cmds: Vec<Cmd>, gfx: &mut Gfx, bg: ([f32; 3], f32), scale: f32) -> Option<Box4> {
+        let mut data = std::mem::take(&mut self.data);
+        if data.len() != self.w * self.h * 4 {
+            data = vec![0; self.w * self.h * 4];
+            self.valid = false;
+        }
+        let changed = self.update_into(cmds, gfx, bg, scale, |_| Some(&mut data[..]));
+        self.data = data;
+        changed.and_then(|boxes| boxes.into_iter().reduce(|a, b| union(Some(a), b).expect("some")))
+    }
+
+    /// `update`, painting into pixels the caller keeps, and telling the boxes that changed apart: two changes far from
+    /// each other (a bar at the top and a pill at the bottom fading in together) are two small boxes, not one that spans
+    /// the window. Once the boxes are known, `target` is asked for a `w` x `h` buffer that holds the last frame's pixels
+    /// everywhere outside them (the window runtime brings one of its shared-memory buffers up to date and hands it
+    /// over, so there is no separate copy of the window to keep). It is not called when nothing changed; when it gives
+    /// no buffer the frame is forgotten (the next update paints everything) and `None` is returned.
+    pub fn update_into<'t>(&mut self, cmds: Vec<Cmd>, gfx: &mut Gfx, bg: ([f32; 3], f32), scale: f32, target: impl FnOnce(&[Box4]) -> Option<&'t mut [u8]>) -> Option<Vec<Box4>> {
         let bg_key = (crate::canvas::rgb8(bg.0), (bg.1 * 255.0) as u8);
-        let full = [0, 0, self.w as i32, self.h as i32];
+        let (w, h) = (self.w as i32, self.h as i32);
+        let clamp = |b: Box4| [b[0].max(0), b[1].max(0), b[2].min(w), b[3].min(h)];
         let boxes = effective(&cmds, gfx, scale);
         let items: Vec<(Cmd, Box4)> = cmds.into_iter().zip(boxes).collect();
-        let damage = if !self.valid || self.bg != Some(bg_key) {
-            full
+        let mut damage = if !self.valid || self.bg != Some(bg_key) {
+            vec![[0, 0, w, h]]
         } else {
             // a command is the same only if it is the same and sits in the same clip
             let head = self.prev.iter().zip(&items).take_while(|(a, b)| a == b).count();
@@ -206,71 +232,177 @@ impl Frame {
             if old.is_empty() && new.is_empty() {
                 return None;
             }
-            let mut dmg = None;
-            for (_, b) in old.iter().chain(new) {
-                if b[0] < b[2] && b[1] < b[3] {
-                    dmg = union(dmg, *b);
-                }
-            }
-            match dmg {
-                Some(d) => [d[0].max(0), d[1].max(0), d[2].min(self.w as i32), d[3].min(self.h as i32)],
-                // only clip commands without area changed: nothing is drawn differently
-                None => {
-                    self.prev = items;
-                    return None;
-                }
-            }
+            // only clip commands without area may have changed: then nothing is drawn differently
+            group(old.iter().chain(new).map(|(_, b)| clamp(*b)).filter(|b| b[0] < b[2] && b[1] < b[3]))
         };
-        if damage[0] >= damage[2] || damage[1] >= damage[3] {
+        if damage.is_empty() {
             self.prev = items;
             return None;
         }
-        // glass reads pixels around it, so a panel touched by the damage is repainted whole (else its unrepainted part
-        // would be blurred twice); growing the box can reach another panel, hence the loop
-        let mut damage = damage;
+        // glass reads pixels around it, so a panel touched by a box is repainted whole (else its unrepainted part would
+        // be blurred twice); growing a box can reach another panel or another box, hence the loop
         loop {
-            let mut grown = damage;
-            for (c, b) in &items {
-                if matches!(c, Cmd::Glass { .. }) && touches(*b, damage) {
-                    grown = [grown[0].min(b[0].max(0)), grown[1].min(b[1].max(0)), grown[2].max(b[2].min(self.w as i32)), grown[3].max(b[3].min(self.h as i32))];
-                }
-            }
-            if grown == damage {
-                break;
-            }
-            damage = grown;
-        }
-        let mut canvas = Canvas::new(&mut self.data, self.w, self.h);
-        canvas.clear_rect(damage, bg_key.0, bg.1);
-        let mut painter = SoftDraw::new(&mut canvas, gfx).scaled(scale);
-        // every command that reaches into the box is painted again, in order, so the result is exact; the clips are
-        // replayed as they were, inside the box
-        let mut clips: Vec<Box4> = Vec::new();
-        for (c, b) in &items {
-            match c {
-                Cmd::PushClip { .. } => {
-                    let cut = intersect(*b, damage);
-                    clips.push(cut);
-                    painter.canvas.set_clip(cut);
-                }
-                Cmd::PopClip => {
-                    clips.pop();
-                    painter.canvas.set_clip(clips.last().copied().unwrap_or(damage));
-                }
-                _ => {
-                    if touches(*b, damage) {
-                        if clips.is_empty() {
-                            painter.canvas.set_clip(damage);
-                        }
-                        paint(c, &mut painter);
+            let mut grew = false;
+            for d in damage.iter_mut() {
+                for (c, b) in &items {
+                    if matches!(c, Cmd::Glass { .. }) && touches(*b, *d) {
+                        let g = union(Some(*d), clamp(*b)).expect("some");
+                        grew |= g != *d;
+                        *d = g;
                     }
                 }
             }
+            if !grew && !merge_touching(&mut damage) {
+                break;
+            }
+        }
+        let Some(data) = target(&damage).filter(|d| d.len() >= self.w * self.h * 4) else {
+            self.valid = false;
+            return None;
+        };
+        let mut canvas = Canvas::new(data, self.w, self.h);
+        for d in &damage {
+            paint_box(&items, &mut canvas, gfx, *d, (bg_key.0, bg.1), scale);
         }
         self.prev = items;
         self.bg = Some(bg_key);
         self.valid = true;
         Some(damage)
+    }
+}
+
+/// Clear the box `damage` and paint again, in order, every command that reaches into it, clipped to it: the pixels come
+/// out exactly as a paint of the whole frame would leave them there.
+fn paint_box(items: &[(Cmd, Box4)], canvas: &mut Canvas, gfx: &mut Gfx, damage: Box4, bg: (crate::canvas::Rgb, f32), scale: f32) {
+    let (bg_rgb, bg_a) = bg;
+    // The box starts as the background, then the commands are painted over it. Panes that come first and cover the
+    // box with one flat colour (the content pane under a list being scrolled) are worked out on one pixel instead:
+    // their flat part `flat` is cleared straight to the result, and they are painted only in the strips left and
+    // right of it. Same bytes, but the pixels are written once rather than once per pane.
+    let bg_px = crate::canvas::clear_pixel(bg_rgb, bg_a);
+    let (mut ground, mut flat, mut folded) = (bg_px, [damage[0], damage[2]], 0);
+    for (i, (c, b)) in items.iter().enumerate() {
+        match c {
+            Cmd::PushClip { .. } | Cmd::PopClip => break,
+            _ if !touches(*b, damage) => continue,
+            Cmd::Fill { r, radius, c, alpha } => {
+                let r = r.map(|v| v * scale);
+                let Some((x0, x1, row_a)) = crate::canvas::flat_part(r[0], r[1], r[2], r[3], radius * scale, *alpha, damage) else { break };
+                let (x0, x1) = (x0.max(flat[0]), x1.min(flat[1]));
+                if x0 >= x1 {
+                    break;
+                }
+                flat = [x0, x1];
+                ground = crate::canvas::flat_pixel(crate::canvas::rgb8(*c), row_a, ground);
+                folded = i + 1;
+            }
+            _ => break,
+        }
+    }
+    let strips = [[damage[0], damage[1], flat[0], damage[3]], [flat[1], damage[1], damage[2], damage[3]]];
+    canvas.clear_rect_to([flat[0], damage[1], flat[1], damage[3]], ground);
+    for s in strips {
+        canvas.clear_rect_to(s, bg_px);
+    }
+    if folded > 0 {
+        let mut painter = SoftDraw::new(&mut *canvas, gfx).scaled(scale);
+        for s in strips.into_iter().filter(|s| s[0] < s[2]) {
+            for (c, b) in &items[..folded] {
+                if touches(*b, s) {
+                    painter.canvas.set_clip(s);
+                    paint(c, &mut painter);
+                }
+            }
+        }
+    }
+    let mut painter = SoftDraw::new(&mut *canvas, gfx).scaled(scale);
+    // every command that reaches into the box is painted again, in order, so the result is exact; the clips are
+    // replayed as they were, inside the box
+    let mut clips: Vec<Box4> = Vec::new();
+    for (c, b) in &items[folded..] {
+        match c {
+            Cmd::PushClip { .. } => {
+                let cut = intersect(*b, damage);
+                clips.push(cut);
+                painter.canvas.set_clip(cut);
+            }
+            Cmd::PopClip => {
+                clips.pop();
+                painter.canvas.set_clip(clips.last().copied().unwrap_or(damage));
+            }
+            _ => {
+                if touches(*b, damage) {
+                    if clips.is_empty() {
+                        painter.canvas.set_clip(damage);
+                    }
+                    paint(c, &mut painter);
+                }
+            }
+        }
+    }
+}
+
+/// The most boxes a frame is repainted in; more are joined (the ones that cost least to join first).
+const MAX_BOXES: usize = 4;
+
+fn area(b: Box4) -> i64 {
+    (b[2] - b[0]).max(0) as i64 * (b[3] - b[1]).max(0) as i64
+}
+
+/// What joining two boxes into their bounding box costs: the pixels it adds that neither covers (negative when they
+/// overlap).
+fn waste(a: Box4, b: Box4) -> i64 {
+    area(union(Some(a), b).expect("some")) - area(a) - area(b)
+}
+
+/// Gather the boxes of the changed commands into a few boxes to repaint: a box joins the group it is near (joining
+/// would add little that is unchanged), groups far apart stay apart.
+fn group(boxes: impl Iterator<Item = Box4>) -> Vec<Box4> {
+    let near = |a: Box4, b: Box4| waste(a, b) <= (area(a) + area(b)) / 4 + 64 * 64;
+    let mut out: Vec<Box4> = Vec::new();
+    for b in boxes {
+        match out.iter().enumerate().map(|(i, c)| (i, waste(*c, b))).min_by_key(|x| x.1) {
+            Some((i, _)) if near(out[i], b) => out[i] = union(Some(out[i]), b).expect("some"),
+            _ => out.push(b),
+        }
+    }
+    // groups that grew into each other's neighbourhood join; then the cheapest pairs until few are left
+    loop {
+        let mut best: Option<(usize, usize, i64)> = None;
+        for i in 0..out.len() {
+            for j in i + 1..out.len() {
+                let w = waste(out[i], out[j]);
+                if best.is_none_or(|(_, _, bw)| w < bw) {
+                    best = Some((i, j, w));
+                }
+            }
+        }
+        match best {
+            Some((i, j, _)) if out.len() > MAX_BOXES || near(out[i], out[j]) || touches(out[i], out[j]) => {
+                let b = out.swap_remove(j);
+                out[i] = union(Some(out[i]), b).expect("some");
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Join boxes that overlap (a pixel must not be cleared after another box painted it). True when any were joined.
+fn merge_touching(boxes: &mut Vec<Box4>) -> bool {
+    let mut merged = false;
+    'again: loop {
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                if touches(boxes[i], boxes[j]) {
+                    let b = boxes.swap_remove(j);
+                    boxes[i] = union(Some(boxes[i]), b).expect("some");
+                    merged = true;
+                    continue 'again;
+                }
+            }
+        }
+        return merged;
     }
 }
 
@@ -306,6 +438,131 @@ mod tests {
         f.resize(200, 150);
         f.update(cmds, gfx, BG, 1.0);
         f.data
+    }
+
+    /// A window like the file manager's at 1.25x: a translucent pane, a glass sidebar, a toolbar, and a list of rows
+    /// with an icon and three columns of text. `hover` is the row under the pointer, `scroll` the list's offset.
+    fn files_like(d: &mut Recorder, hover: usize, scroll: f32) {
+        let (w, h) = (1200.0, 775.0);
+        d.fill([0.0, 0.0, w, h], 14.0, [0.97, 0.97, 0.98], 0.92);
+        // the paper of the content, as the file manager lays it next to its sidebar
+        d.fill([240.0, 0.0, w - 240.0, h], 0.0, [1.0; 3], 0.78);
+        d.fill([12.0, 12.0, 220.0, h - 24.0], 12.0, [0.6, 0.65, 0.75], 0.5);
+        for i in 0..10 {
+            let y = 70.0 + i as f32 * 36.0;
+            d.glyph(40.0, y, 16.0, "folder", [0.9, 0.5, 0.2], 1.0);
+            d.text(60.0, y + 5.0, ["Home", "Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "Trash", "This computer", "Data"][i], 14.0, false, [0.1; 3], 0.9, Align::Left);
+        }
+        d.grad([250.0, 0.0, w - 250.0, 60.0], 0.0, [1.0; 3], [0.95; 3], 0.8);
+        d.text(300.0, 30.0, "mykhailo", 15.0, true, [0.1; 3], 1.0, Align::Left);
+        d.push_clip([250.0, 110.0, w - 250.0, h - 140.0]);
+        for i in 0..40 {
+            let y = 110.0 + i as f32 * 32.0 - scroll;
+            if y < 80.0 || y > h {
+                continue;
+            }
+            if i % 2 == 1 {
+                d.fill([260.0, y, w - 280.0, 30.0], 6.0, [0.5; 3], 0.04);
+            }
+            if i == hover {
+                d.fill([260.0, y, w - 280.0, 30.0], 6.0, [0.2, 0.5, 1.0], 0.12);
+            }
+            d.glyph(285.0, y + 15.0, 18.0, "folder", [0.9, 0.5, 0.2], 1.0);
+            d.text(310.0, y + 20.0, &format!("Folder number {i}"), 14.0, false, [0.1; 3], 1.0, Align::Left);
+            d.text(720.0, y + 20.0, "Folder", 13.0, false, [0.4; 3], 1.0, Align::Left);
+            d.text(860.0, y + 20.0, &format!("{} Oct 2026, 12:{:02}", i % 28 + 1, i), 13.0, false, [0.4; 3], 1.0, Align::Left);
+        }
+        d.pop_clip();
+        d.glass([270.0, 70.0, 560.0, 36.0], 18.0, 1.0, false);
+        d.text(290.0, 93.0, "New   Cut   Copy   Paste   Rename   Delete", 13.0, false, [0.2; 3], 1.0, Align::Left);
+    }
+
+    /// `cargo test --release -p chebrium --no-default-features bench_ -- --ignored --nocapture`: time recording and
+    /// painting of hover, scroll and unchanged frames of `files_like` (what one frame of a list costs the processor).
+    #[test]
+    #[ignore]
+    fn bench_frames() {
+        let s = 1.25;
+        let mut gfx = Gfx::new();
+        let mut f = Frame::default();
+        f.resize(1500, 969);
+        let mut run = |name: &str, frames: usize, full: bool, scene: &dyn Fn(&mut Recorder, usize)| {
+            // warm the caches as a running program has them
+            for k in 0..3 {
+                let mut r = Recorder::new(&mut gfx, s);
+                scene(&mut r, k);
+                f.update(r.cmds, &mut gfx, BG, s);
+            }
+            let t = std::time::Instant::now();
+            let mut px = 0u64;
+            for k in 0..frames {
+                let mut r = Recorder::new(&mut gfx, s);
+                scene(&mut r, k);
+                if full {
+                    f.invalidate();
+                }
+                if let Some(d) = f.update(r.cmds, &mut gfx, BG, s) {
+                    px += ((d[2] - d[0]) * (d[3] - d[1])) as u64;
+                }
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            eprintln!("{name:>10}: {ms:.3} ms a frame, {}k px repainted a frame", px / frames as u64 / 1000);
+        };
+        run("idle", 200, false, &|r, _| files_like(r, 99, 0.0));
+        run("hover", 200, false, &|r, k| files_like(r, k % 18, 0.0));
+        run("scroll", 100, false, &|r, k| files_like(r, 99, (k % 50) as f32 * 4.0));
+        run("full", 30, true, &|r, _| files_like(r, 99, 0.0));
+    }
+
+    #[test]
+    fn a_list_scrolled_and_hovered_over_flat_panes_repaints_exactly() {
+        let s = 1.25;
+        let mut gfx = Gfx::new();
+        let scratch = |gfx: &mut Gfx, hover: usize, scroll: f32| {
+            let mut r = Recorder::new(gfx, s);
+            files_like(&mut r, hover, scroll);
+            let cmds = r.cmds;
+            let mut f = Frame::default();
+            f.resize(1500, 969);
+            f.update(cmds, gfx, BG, s);
+            f.data
+        };
+        let mut f = Frame::default();
+        f.resize(1500, 969);
+        for (k, (hover, scroll)) in [(99, 0.0), (3, 0.0), (4, 0.0), (4, 7.5), (9, 13.0), (99, 2.0)].into_iter().enumerate() {
+            let mut r = Recorder::new(&mut gfx, s);
+            files_like(&mut r, hover, scroll);
+            let cmds = r.cmds;
+            f.update(cmds, &mut gfx, BG, s);
+            if k > 0 {
+                assert!(f.data == scratch(&mut gfx, hover, scroll), "step {k}: hover {hover}, scroll {scroll}");
+            }
+        }
+    }
+
+    #[test]
+    fn changes_far_apart_are_repainted_as_separate_boxes_exactly() {
+        let mut gfx = Gfx::new();
+        // a bar at the top and a pill with glass at the bottom fade in together, over stripes
+        let scene = |a: f32| {
+            move |d: &mut Recorder| {
+                d.fill([0.0, 0.0, 200.0, 150.0], 0.0, [0.1, 0.1, 0.15], 1.0);
+                for k in 0..10 {
+                    d.fill([k as f32 * 20.0, 0.0, 10.0, 150.0], 0.0, [1.0, 0.3, 0.2], 1.0);
+                }
+                d.fill([0.0, 0.0, 200.0, 20.0], 0.0, [0.0; 3], 0.45 * a);
+                d.text(10.0, 15.0, "name.png", 12.0, true, [1.0; 3], a, Align::Left);
+                d.glass([50.0, 120.0, 100.0, 24.0], 12.0, a, true);
+            }
+        };
+        let mut f = Frame::default();
+        f.resize(200, 150);
+        f.update(frame_of(scene(0.2), &mut gfx), &mut gfx, BG, 1.0);
+        let mut data = f.data.clone();
+        let boxes = f.update_into(frame_of(scene(0.7), &mut gfx), &mut gfx, BG, 1.0, |_| Some(&mut data[..])).expect("changed");
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        assert!(boxes.iter().all(|b| b[3] <= 40 || b[1] >= 100), "{boxes:?}");
+        assert!(data == from_scratch(frame_of(scene(0.7), &mut gfx), &mut gfx));
     }
 
     #[test]

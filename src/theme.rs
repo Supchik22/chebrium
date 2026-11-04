@@ -126,6 +126,7 @@ impl Appearance {
         }
         a.controls.depth = num("controls_depth").unwrap_or(a.controls.depth).clamp(0.0, 1.5);
         a.controls.round = num("controls_round").unwrap_or(a.controls.round).clamp(0.0, 1.0);
+        a.controls.thickness = num("controls_thickness").unwrap_or(a.controls.thickness).clamp(0.0, 1.0);
         if let Some(v) = t.get("controls_accent").and_then(|v| v.as_bool()) {
             a.controls.accent_pick = v;
         }

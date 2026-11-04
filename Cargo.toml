@@ -5,9 +5,12 @@ edition = "2021"
 description = "A tiny animated UI/UX toolkit: springs, a software canvas, Lucide icons, Inter text and an immediate-mode widget kit shared by every Memrium program."
 
 [features]
-default = ["app", "appmenu"]
+default = ["app", "appmenu", "gpu"]
 # the Wayland window runtime (`chebrium::app`); a program that only paints into its own buffer can turn it off
 app = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:wayland-protocols", "appmenu"]
+
+# pictures drawn on the graphics card under the window's controls (`Host::layer`); without it they are drawn on the processor
+gpu = ["app", "wayland-client/system", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # program menus in the desktop's menu bar (D-Bus)
 appmenu = ["dep:zbus"]
@@ -18,6 +21,9 @@ ttf-parser = "0.25"
 resvg = { version = "0.45", default-features = false }
 toml = "0.8"
 libc = "0.2"
+wgpu = { version = "25", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 smithay-client-toolkit = { version = "0.19", optional = true }
 wayland-client = { version = "0.31", optional = true }
 # the fractional scale and the viewport (a program draws for the exact scale and says how big the surface is)

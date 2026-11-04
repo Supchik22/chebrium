@@ -61,11 +61,14 @@ pub struct Controls {
     /// several accent colours by context (switches green, a battery green or amber, a warning orange ...), the main one
     /// staying the accent
     pub multi: bool,
+    /// 0 .. 1: how thick switches and sliders are: 0 slim (a low track, a knob squashed into a short pill), 1 the full
+    /// round size
+    pub thickness: f32,
 }
 
 impl Default for Controls {
     fn default() -> Controls {
-        Controls { kind: ControlKind::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false }
+        Controls { kind: ControlKind::Keys, depth: 1.0, round: 1.0, accent_pick: false, multi: false, thickness: 0.0 }
     }
 }
 
@@ -73,6 +76,11 @@ impl Controls {
     /// The colour for a tone: the accent when there is a single one.
     pub fn tone(&self, accent: [f32; 3], tone: Tone) -> [f32; 3] {
         if self.multi { tone.colour(accent) } else { accent }
+    }
+
+    /// `slim` at thickness 0, `full` at 1.
+    pub fn thick(&self, slim: f32, full: f32) -> f32 {
+        slim + (full - slim) * self.thickness.clamp(0.0, 1.0)
     }
 
     /// A corner radius that is `full` at roundness 1 and a squarer one below it.

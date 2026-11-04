@@ -54,7 +54,10 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{
+        slot::{Buffer, SlotPool},
+        Shm, ShmHandler,
+    },
 };
 use smithay_client_toolkit::reexports::csd_frame::WindowState;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
@@ -63,7 +66,10 @@ use std::os::fd::OwnedFd;
 use std::time::Duration;
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_compositor::WlCompositor, wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_region::WlRegion, wl_seat, wl_shm, wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface, wl_surface,
+    },
     Connection, QueueHandle,
 };
 
@@ -191,6 +197,26 @@ impl Config {
     }
 }
 
+/// Something dragged out of the window (see `Host::start_drag`).
+pub struct DragOut {
+    /// What is offered, best first: a type (`image/png`, `text/uri-list` ...) and what makes its bytes. That runs on a
+    /// thread of its own when the program it is dropped on asks for it, so it may wait for work still being done.
+    pub offers: Vec<(String, std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>)>,
+    /// the picture that follows the pointer
+    pub icon: Option<DragIcon>,
+}
+
+/// The picture under the pointer while something is dragged.
+pub struct DragIcon {
+    /// straight RGBA, `w * h * 4` bytes, in physical pixels (`scale` of them per logical pixel)
+    pub rgba: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub scale: i32,
+    /// the point of the picture that is under the pointer (logical px from its top-left corner)
+    pub hot: [i32; 2],
+}
+
 /// What the program can ask of the runtime.
 #[derive(Default)]
 pub struct Host {
@@ -233,8 +259,23 @@ pub struct Host {
     pub copy_image: Option<Vec<u8>>,
     /// ask for the clipboard's text: it arrives in `App::clipboard`
     pub paste: bool,
+    /// Start dragging something out of the window, to another program (set it while the button of a press is still
+    /// down). From then on the desktop runs the drag: the window gets no pointer events until it ends.
+    pub start_drag: Option<DragOut>,
+    /// a drag begun with `start_drag` is still going (set by the runtime; it goes false at the drop or a cancel)
+    pub dragging: bool,
     /// the pointer shape to show (`None`: whatever the widgets under the pointer asked for)
     pub cursor: Option<crate::ui::Cursor>,
+    /// A picture to show on the graphics card, under everything the program draws (set it every frame, only when
+    /// `gpu_layer` is true; the window's own background is then left see-through for it). A program that zooms and pans
+    /// a big picture uses it instead of `Ui::picture`, which paints every pixel on the processor.
+    pub layer: Option<crate::picture::PictureLayer>,
+    /// A live frame (camera, video) to show on the card the same way; set it every frame, only when `gpu_layer` is true.
+    /// Without a card, draw `frame.to_pic()` yourself. If both this and `layer` are set, this one is shown.
+    pub live: Option<crate::live::LiveLayer>,
+    /// the runtime can show a `layer` (set by the runtime; false when there is no graphics card to do it, so the program
+    /// draws the picture itself)
+    pub gpu_layer: bool,
 }
 
 /// An edge or corner of the window.
@@ -263,6 +304,12 @@ impl Edge {
             Edge::BottomRight => ResizeEdge::BottomRight,
         }
     }
+}
+
+/// What the card shows under the window: a picture, or a live frame.
+enum Layer {
+    Still(crate::picture::PictureLayer),
+    Live(crate::live::LiveLayer),
 }
 
 /// Wakes the program from another thread: a decoder that finished a picture, a player with a new video frame. The
@@ -402,6 +449,10 @@ struct Runtime<A: App> {
     data_device_manager: DataDeviceManagerState,
     data_device: Option<DataDevice>,
     copy_source: Option<CopyPasteSource>,
+    /// a drag out of the window: its source, what it offers, and the picture under the pointer (kept alive until it ends)
+    drag_source: Option<smithay_client_toolkit::data_device_manager::data_source::DragSource>,
+    drag_offers: Vec<(String, std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync>)>,
+    drag_icon: Option<(wl_surface::WlSurface, SlotPool)>,
     clip_text: String,
     /// the picture on the clipboard when we copied one (then `clip_text` is empty)
     clip_png: Vec<u8>,
@@ -413,8 +464,58 @@ struct Runtime<A: App> {
     drop_out: Outbox<(Vec<std::path::PathBuf>, String)>,
     drop_in: Inbox<(Vec<std::path::PathBuf>, String)>,
     perf: Perf,
-    last_trim: std::time::Instant,
+    /// window buffers kept for the next frames (see `Kept`)
+    buffers: Vec<Kept>,
+    /// a frame was drawn since memory was last handed back to the system
+    trim_wanted: bool,
+    /// the timer that hands it back is armed
+    trim_armed: bool,
+    /// the appearance file is watched (inotify): no need to look at it on a timer
+    look_watched: bool,
     menu: Option<crate::appmenu::Client>,
+    conn: Connection,
+    wl_compositor: WlCompositor,
+    subcompositor: Option<WlSubcompositor>,
+    viewporter: Option<WpViewporter>,
+    /// the surface under the window that carries `Host::layer`
+    under: Option<Under>,
+}
+
+/// A shared-memory buffer the window showed before, kept to be drawn into again once the compositor lets go of it.
+/// It already holds an older frame, so only what changed since then is copied in, instead of the whole window every
+/// frame into a fresh buffer (which also had the kernel hand out new pages each time).
+struct Kept {
+    buffer: Buffer,
+    w: usize,
+    h: usize,
+    /// the parts of the window this buffer is behind on (x0, y0, x1, y1); empty: it is up to date
+    stale: Vec<[i32; 4]>,
+}
+
+/// Buffers kept at most: one on screen, one being drawn, and one more for a compositor that holds on to the last two.
+const KEPT_BUFFERS: usize = 3;
+
+/// The subsurface below the window, with the graphics card drawing into it.
+struct Under {
+    // dropped first: the card's surface must go before the wl_surface it was made for
+    #[cfg(feature = "gpu")]
+    gpu: Option<crate::layer::GpuLayer>,
+    surface: wl_surface::WlSurface,
+    subsurface: WlSubsurface,
+    viewport: Option<WpViewport>,
+    shown: bool,
+}
+
+impl Drop for Under {
+    fn drop(&mut self) {
+        #[cfg(feature = "gpu")]
+        drop(self.gpu.take());
+        self.subsurface.destroy();
+        if let Some(v) = self.viewport.take() {
+            v.destroy();
+        }
+        self.surface.destroy();
+    }
 }
 
 impl<A: App + 'static> Runtime<A> {
@@ -470,6 +571,62 @@ impl<A: App + 'static> Runtime<A> {
         }
     }
 
+    /// A drag out of the window, as the program asked during the frame.
+    fn drag_ops(&mut self) {
+        let Some(d) = self.host.start_drag.take() else { return };
+        if self.data_device.is_none() {
+            return;
+        }
+        let mimes: Vec<String> = d.offers.iter().map(|o| o.0.clone()).collect();
+        let source = self.data_device_manager.create_drag_and_drop_source(&self.qh, mimes, DndAction::Copy);
+        let icon = d.icon.and_then(|ic| self.drag_icon_surface(ic));
+        let Some(dd) = &self.data_device else { return };
+        source.start_drag(dd, self.window.wl_surface(), icon.as_ref().map(|i| &i.0), self.serial);
+        self.drag_source = Some(source);
+        self.drag_offers = d.offers;
+        self.drag_icon = icon;
+        self.host.dragging = true;
+    }
+
+    /// A surface showing `ic`, placed so that its hot point is under the pointer.
+    fn drag_icon_surface(&mut self, ic: DragIcon) -> Option<(wl_surface::WlSurface, SlotPool)> {
+        let (w, h) = (ic.w as i32, ic.h as i32);
+        if w <= 0 || h <= 0 || ic.rgba.len() != (w * h * 4) as usize {
+            return None;
+        }
+        let mut pool = SlotPool::new((w * h * 4) as usize, &self.shm).ok()?;
+        let (buffer, canvas) = pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888).ok()?;
+        // premultiplied BGRA, as the desktop reads ARGB8888
+        for (o, p) in canvas.chunks_exact_mut(4).zip(ic.rgba.chunks_exact(4)) {
+            let a = p[3] as u32;
+            let pm = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+            o.copy_from_slice(&[pm(p[2]), pm(p[1]), pm(p[0]), p[3]]);
+        }
+        let surface = self.wl_compositor.create_surface(&self.qh, ());
+        surface.set_buffer_scale(ic.scale.max(1));
+        // the top-left corner starts at the pointer: the picture is moved so that its hot point is there instead
+        if wayland_client::Proxy::version(&surface) >= 5 {
+            surface.offset(-ic.hot[0], -ic.hot[1]);
+            surface.attach(Some(buffer.wl_buffer()), 0, 0);
+        } else {
+            surface.attach(Some(buffer.wl_buffer()), -ic.hot[0], -ic.hot[1]);
+        }
+        surface.damage_buffer(0, 0, w, h);
+        surface.commit();
+        Some((surface, pool))
+    }
+
+    /// The drag out of the window is over (dropped or cancelled).
+    fn drag_ended(&mut self) {
+        self.drag_source = None;
+        self.drag_offers.clear();
+        if let Some((surface, _)) = self.drag_icon.take() {
+            surface.destroy();
+        }
+        self.host.dragging = false;
+        self.dirty = true;
+    }
+
     /// The clipboard, as the program asked during the frame.
     fn clipboard_ops(&mut self) {
         if let Some(text) = self.host.copy.take() {
@@ -517,11 +674,6 @@ impl<A: App + 'static> Runtime<A> {
 
     /// The shell changed its look (or its language): follow it.
     fn follow_look(&mut self) {
-        // free memory goes back to the system now and then (what a decoder or an image load left behind)
-        if self.last_trim.elapsed() > Duration::from_secs(5) {
-            crate::mem::trim();
-            self.last_trim = std::time::Instant::now();
-        }
         let stamp = Appearance::stamp();
         if stamp != self.look_stamp {
             self.look_stamp = stamp;
@@ -550,6 +702,99 @@ impl<A: App + 'static> Runtime<A> {
         }
     }
 
+    /// Open the surface under the window and the card behind it.
+    #[cfg(feature = "gpu")]
+    fn open_under(&self) -> Result<Under, String> {
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        let sub = self.subcompositor.as_ref().ok_or("the desktop has no wl_subcompositor")?;
+        let parent = self.window.wl_surface();
+        let surface = self.wl_compositor.create_surface(&self.qh, ());
+        let subsurface = sub.get_subsurface(&surface, parent, &self.qh, ());
+        // the card presents when it likes; the window's controls do not wait for it, nor it for them
+        subsurface.set_desync();
+        subsurface.place_below(parent);
+        // the controls above take the pointer: the picture takes none
+        let none = self.wl_compositor.create_region(&self.qh, ());
+        surface.set_input_region(Some(&none));
+        none.destroy();
+        let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, &self.qh, ()));
+        // the stacking order is applied with the window's next commit
+        self.window.commit();
+        let display = NonNull::new(self.conn.backend().display_ptr() as *mut c_void).ok_or("no wl_display")?;
+        let handle = NonNull::new(wayland_client::Proxy::id(&surface).as_ptr() as *mut c_void).ok_or("no wl_surface")?;
+        let gpu = crate::layer::GpuLayer::new(display, handle);
+        let gpu = match gpu {
+            Ok(g) => g,
+            Err(e) => {
+                // the objects made so far go with this
+                drop(Under { gpu: None, surface, subsurface, viewport, shown: false });
+                return Err(e);
+            }
+        };
+        Ok(Under { gpu: Some(gpu), surface, subsurface, viewport, shown: false })
+    }
+
+    /// Show (or hide) the program's picture layer for a window of `w` x `h` device pixels. True when the layer is on screen:
+    /// the window's own pixels must then leave it see-through.
+    #[cfg(feature = "gpu")]
+    fn place_layer(&mut self, layer: Option<Layer>, w: usize, h: usize, fs: f32) -> bool {
+        let Some(l) = layer else {
+            if let Some(u) = self.under.as_mut().filter(|u| u.shown) {
+                u.surface.attach(None, 0, 0);
+                u.surface.commit();
+                u.shown = false;
+                if let Some(g) = &mut u.gpu {
+                    g.forget();
+                }
+            }
+            return false;
+        };
+        if self.under.is_none() {
+            match self.open_under() {
+                Ok(u) => self.under = Some(u),
+                Err(e) => {
+                    eprintln!("chebrium: no picture on the card ({e}); drawing it on the processor");
+                    self.host.gpu_layer = false;
+                    return false;
+                }
+            }
+        }
+        let (scale, frac) = (self.scale, self.frac);
+        let (width, height) = (self.width as i32, self.height as i32);
+        let Some(u) = self.under.as_mut() else { return false };
+        match (&u.viewport, frac) {
+            (Some(v), Some(_)) => {
+                u.surface.set_buffer_scale(1);
+                v.set_destination(width, height);
+            }
+            _ => u.surface.set_buffer_scale(scale),
+        }
+        let Some(gpu) = u.gpu.as_mut() else { return false };
+        let size = [w as u32, h as u32];
+        let result = match &l {
+            Layer::Still(p) => gpu.render(size, fs, p),
+            Layer::Live(p) => gpu.render_live(size, fs, p),
+        };
+        match result {
+            Ok(()) => {
+                u.shown = true;
+                true
+            }
+            Err(e) => {
+                eprintln!("chebrium: the card could not draw the picture ({e}); drawing it on the processor");
+                self.host.gpu_layer = false;
+                self.under = None;
+                false
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn place_layer(&mut self, _: Option<Layer>, _: usize, _: usize, _: f32) -> bool {
+        false
+    }
+
     fn draw(&mut self) {
         self.dirty = false;
         let s = self.scale;
@@ -573,7 +818,7 @@ impl<A: App + 'static> Runtime<A> {
             self.host.menu_bar = client.available() && self.host.appearance.menubar;
         }
         self.app.tick(&mut self.host);
-        let (bg, bg_a) = self.app.background(&self.host.appearance);
+        let (bg, mut bg_a) = self.app.background(&self.host.appearance);
         let t_build = std::time::Instant::now();
         let dt = self.state.begin_frame();
         let style = self.app.style(&self.host.appearance);
@@ -584,6 +829,16 @@ impl<A: App + 'static> Runtime<A> {
         self.app.draw(&mut ui, [self.width as f32, self.height as f32], &mut self.host);
         let seen = ui.edit_seen;
         let cmds = recorder.cmds;
+        // a picture on the card goes under the window: its own pixels are left see-through for it
+        let (still, live) = (self.host.layer.take(), self.host.live.take());
+        let layer = live.map(Layer::Live).or(still.map(Layer::Still));
+        let wanted = layer.is_some();
+        if self.place_layer(layer, w, h, fs) {
+            bg_a = 0.0;
+        } else if wanted {
+            // the card cannot do it: draw the frame again, the program puts the picture in itself now
+            return self.draw();
+        }
         self.window_ops();
         if let Some(m) = self.host.set_min_size.take() {
             if !self.host.fixed {
@@ -603,6 +858,7 @@ impl<A: App + 'static> Runtime<A> {
             }
         }
         self.clipboard_ops();
+        self.drag_ops();
         self.cursor_ops();
         self.state.end_frame(seen);
         // moving things need another frame; the frame callback below delivers it
@@ -620,42 +876,59 @@ impl<A: App + 'static> Runtime<A> {
         }
         let surface = self.window.wl_surface().clone();
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        // the frame is painted straight into a window buffer: one the compositor has let go of, brought up to date
         let t_update = std::time::Instant::now();
-        let damage = self.frame.update(cmds, &mut self.gfx, (bg, bg_a), fs);
+        let (pool, buffers) = (&mut self.pool, &mut self.buffers);
+        let mut chosen = None;
+        let (chosen_out, mut copy_ms) = (&mut chosen, 0.0);
+        let copy_out = &mut copy_ms;
+        let damage = self.frame.update_into(cmds, &mut self.gfx, (bg, bg_a), fs, move |damage: &[[i32; 4]]| {
+            let t = std::time::Instant::now();
+            let i = ready_buffer(pool, buffers, w, h, damage)?;
+            *chosen_out = Some(i);
+            *copy_out = t.elapsed().as_secs_f64() * 1000.0;
+            buffers[i].buffer.canvas(pool)
+        });
         if self.perf.on {
             self.perf.build += build_ms;
-            self.perf.update += t_update.elapsed().as_secs_f64() * 1000.0;
+            self.perf.update += t_update.elapsed().as_secs_f64() * 1000.0 - copy_ms;
         }
-        let Some(damage) = damage else {
+        let (Some(damage), Some(i)) = (damage, chosen) else {
             if self.perf.on {
                 self.perf.skipped += 1;
                 self.perf.report();
             }
+            if !self.frame.is_valid() {
+                // no buffer could be had: the frame was forgotten and is drawn again, in full
+                self.dirty = true;
+            }
             // nothing on screen changed: no buffer is sent, but an animation still needs its next callback
-            if more {
+            if more || self.dirty {
                 surface.frame(&self.qh, surface.clone());
                 self.window.commit();
                 self.frame_pending = true;
             }
             return;
         };
-        let (buffer, data) = match self.pool.create_buffer(w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("chebrium: buffer: {e}");
-                self.frame.invalidate();
-                return;
+        // every other buffer is now behind on the changed boxes; the one painted goes to the end of the list, so the
+        // list runs from the one unused the longest to the one on screen
+        for (k, kept) in self.buffers.iter_mut().enumerate() {
+            if k != i {
+                kept.stale.extend_from_slice(&damage);
+                if kept.stale.len() > 8 {
+                    // many small parts: one box around them is copied instead
+                    let all = kept.stale.iter().fold(kept.stale[0], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+                    kept.stale = vec![all];
+                }
             }
-        };
-        // a fresh buffer holds nothing of the last frame, so it gets all the pixels; only the changed box is damaged
-        // (the pool may hand out a buffer a little larger than the frame: it is rounded up to its alignment)
-        let t_copy = std::time::Instant::now();
-        let n = self.frame.data.len().min(data.len());
-        data[..n].copy_from_slice(&self.frame.data[..n]);
+        }
+        let kept = self.buffers.remove(i);
+        self.buffers.push(kept);
+        let buffer = &self.buffers.last().expect("just pushed").buffer;
         if self.perf.on {
             self.perf.frames += 1;
-            self.perf.copy += t_copy.elapsed().as_secs_f64() * 1000.0;
-            self.perf.pixels += ((damage[2] - damage[0]).max(0) as u64) * ((damage[3] - damage[1]).max(0) as u64);
+            self.perf.copy += copy_ms;
+            self.perf.pixels += damage.iter().map(|d| ((d[2] - d[0]).max(0) as u64) * ((d[3] - d[1]).max(0) as u64)).sum::<u64>();
             self.perf.report();
         }
         match (&self.viewport, self.frac) {
@@ -666,12 +939,36 @@ impl<A: App + 'static> Runtime<A> {
             }
             _ => surface.set_buffer_scale(s),
         }
-        surface.damage_buffer(damage[0], damage[1], damage[2] - damage[0], damage[3] - damage[1]);
+        for d in &damage {
+            surface.damage_buffer(d[0], d[1], d[2] - d[0], d[3] - d[1]);
+        }
         surface.frame(&self.qh, surface.clone());
         if buffer.attach_to(&surface).is_ok() {
             self.window.commit();
             self.frame_pending = true;
         }
+        self.want_trim();
+    }
+
+    /// Free memory goes back to the system a few seconds after the program last drew (what a decoder, an image load or
+    /// a burst of frames left behind). A timer does it once and goes away, so an idle program is not woken for it.
+    fn want_trim(&mut self) {
+        self.trim_wanted = true;
+        if self.trim_armed {
+            return;
+        }
+        use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+        let armed = self.loop_handle.insert_source(Timer::from_duration(Duration::from_secs(5)), |_, _, rt: &mut Runtime<A>| {
+            if std::mem::take(&mut rt.trim_wanted) {
+                crate::mem::trim();
+                // drawn again since the timer was set: look again later
+                TimeoutAction::ToDuration(Duration::from_secs(5))
+            } else {
+                rt.trim_armed = false;
+                TimeoutAction::Drop
+            }
+        });
+        self.trim_armed = armed.is_ok();
     }
 
     fn on_key(&mut self, event: KeyEvent) {
@@ -698,7 +995,9 @@ impl<A: App + 'static> Runtime<A> {
             Keysym::F2 => Some(Key::F2),
             Keysym::F5 => Some(Key::F5),
             // with Ctrl held the text is a control character; shortcuts want the plain letter
-            _ if mods.ctrl => event.keysym.key_char().map(|c| Key::Char(c.to_ascii_lowercase())),
+            // on another layout (Ukrainian, Russian...) the letter is not Latin: take the key's place on the keyboard instead,
+            // so Ctrl+C/V/X/A/Z work the same on every layout
+            _ if mods.ctrl => event.keysym.key_char().map(|c| c.to_ascii_lowercase()).map(|c| if c.is_ascii() { c } else { qwerty_letter(event.raw_code).unwrap_or(c) }).map(Key::Char),
             _ => event.utf8.as_deref().and_then(|t| t.chars().find(|c| !c.is_control())).map(Key::Char),
         };
         let Some(key) = key else { return };
@@ -714,6 +1013,74 @@ impl<A: App + 'static> Runtime<A> {
         }
         self.schedule();
     }
+}
+
+/// A window buffer of `w` x `h` to paint the next frame into, holding the last frame's pixels everywhere outside
+/// `damage` (the parts that are painted anew): its index in `buffers`. A buffer the compositor has let go of is reused and
+/// gets only what it is behind on, copied from the buffer on screen (the last in the list); a new one is made when all
+/// are still held. `None` when there is no memory for one, or nothing to bring it up to date from.
+fn ready_buffer(pool: &mut SlotPool, buffers: &mut Vec<Kept>, w: usize, h: usize, damage: &[[i32; 4]]) -> Option<usize> {
+    buffers.retain(|k| (k.w, k.h) == (w, h));
+    let free = buffers.iter().position(|k| k.buffer.canvas(pool).is_some());
+    let at = match free {
+        Some(i) => i,
+        None => {
+            let buffer = match pool.create_buffer(w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888) {
+                Ok((b, _)) => b,
+                Err(e) => {
+                    eprintln!("chebrium: buffer: {e}");
+                    return None;
+                }
+            };
+            // all of them still held (a compositor that keeps buffers long): the oldest goes, destroyed once released;
+            // never the one on screen, which the new one is filled from
+            if buffers.len() >= KEPT_BUFFERS {
+                buffers.remove(0);
+            }
+            buffers.push(Kept { buffer, w, h, stale: vec![[0, 0, w as i32, h as i32]] });
+            buffers.len() - 1
+        }
+    };
+    // what is painted anew needs no copy
+    let inside = |a: [i32; 4], b: [i32; 4]| a[0] >= b[0] && a[1] >= b[1] && a[2] <= b[2] && a[3] <= b[3];
+    let mut stale = std::mem::take(&mut buffers[at].stale);
+    stale.retain(|st| !damage.iter().any(|d| inside(*st, *d)));
+    if stale.is_empty() {
+        return Some(at);
+    }
+    let src = buffers.len() - 1;
+    if src == at {
+        // behind on something with nothing to copy it from: the caller paints everything
+        buffers[at].stale = stale;
+        return None;
+    }
+    let stride = w * 4;
+    let len = h * stride;
+    // the buffer on screen may still be read by the compositor; reading it here too is fine (only writing is not)
+    let from = pool.raw_data_mut(&buffers[src].buffer.slot()).as_ptr();
+    let to = buffers[at].buffer.canvas(pool)?;
+    if to.len() < len {
+        return None;
+    }
+    // SAFETY: the two buffers are different slots of the pool (`at != src`), so `from` (valid for `len` bytes: every
+    // kept buffer is w x h with this stride) does not overlap `to`, and nothing writes the source meanwhile
+    let from = unsafe { std::slice::from_raw_parts(from, len) };
+    for st in stale {
+        let (x0, x1) = (st[0].clamp(0, w as i32) as usize * 4, st[2].clamp(0, w as i32) as usize * 4);
+        if x0 < x1 {
+            for y in st[1].clamp(0, h as i32) as usize..st[3].clamp(0, h as i32) as usize {
+                let row = y * stride;
+                to[row + x0..row + x1].copy_from_slice(&from[row + x0..row + x1]);
+            }
+        }
+    }
+    Some(at)
+}
+
+/// The Latin letter printed on the key with this evdev code on a QWERTY keyboard.
+fn qwerty_letter(code: u32) -> Option<char> {
+    const ROWS: [(u32, &str); 3] = [(16, "qwertyuiop"), (30, "asdfghjkl"), (44, "zxcvbnm")];
+    ROWS.iter().find_map(|(first, row)| code.checked_sub(*first).and_then(|i| row.chars().nth(i as usize)))
 }
 
 impl<A: App + 'static> CompositorHandler for Runtime<A> {
@@ -938,8 +1305,18 @@ impl<A: App + 'static> DataOfferHandler for Runtime<A> {
 impl<A: App + 'static> DataSourceHandler for Runtime<A> {
     fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
 
-    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, mime: String, fd: WritePipe) {
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource, mime: String, fd: WritePipe) {
         let mut f = std::fs::File::from(OwnedFd::from(fd));
+        // what was dragged out: made on a thread, as it may still be in the works
+        if self.drag_source.as_ref().is_some_and(|s| s.inner() == source) {
+            if let Some((_, make)) = self.drag_offers.iter().find(|(m, _)| *m == mime) {
+                let make = make.clone();
+                std::thread::spawn(move || {
+                    let _ = f.write_all(&make());
+                });
+            }
+            return;
+        }
         let _ = if mime == "image/png" { f.write_all(&self.clip_png) } else { f.write_all(self.clip_text.as_bytes()) };
     }
 
@@ -947,11 +1324,18 @@ impl<A: App + 'static> DataSourceHandler for Runtime<A> {
         if self.copy_source.as_ref().is_some_and(|s| s.inner() == source) {
             self.copy_source = None;
         }
+        if self.drag_source.as_ref().is_some_and(|s| s.inner() == source) {
+            self.drag_ended();
+        }
         source.destroy();
     }
 
     fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
-    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if self.drag_source.as_ref().is_some_and(|s| s.inner() == source) {
+            self.drag_ended();
+        }
+    }
     fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
@@ -972,6 +1356,10 @@ delegate_compositor!(@<A: App + 'static> Runtime<A>);
 wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WpFractionalScaleManagerV1);
 wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WpViewporter);
 wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WpViewport);
+wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WlSubcompositor);
+wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WlSubsurface);
+wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore WlRegion);
+wayland_client::delegate_noop!(@<A: App + 'static> Runtime<A>: ignore wl_surface::WlSurface);
 
 impl<A: App + 'static> wayland_client::Dispatch<WpFractionalScaleV1, ()> for Runtime<A> {
     fn event(state: &mut Self, _: &WpFractionalScaleV1, event: wp_fractional_scale_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
@@ -1006,6 +1394,8 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
     WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone()).unwrap();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor");
+    let subcompositor = globals.bind::<WlSubcompositor, _, _>(&qh, 1..=1, ()).ok();
+    let viewporter_global = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok();
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_shell");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm");
     let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).expect("wl_data_device_manager");
@@ -1063,7 +1453,7 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         state: State::default(),
         gfx: Gfx::new(),
         frame: Frame::default(),
-        host: Host { appearance: look, fixed: !config.resizable, ..Host::default() },
+        host: Host { appearance: look, fixed: !config.resizable, gpu_layer: cfg!(feature = "gpu") && subcompositor.is_some(), ..Host::default() },
         app,
         seat: None,
         serial: 0,
@@ -1071,6 +1461,9 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         data_device_manager,
         data_device: None,
         copy_source: None,
+        drag_source: None,
+        drag_offers: Vec::new(),
+        drag_icon: None,
         clip_text: String::new(),
         clip_png: Vec::new(),
         input_serial: 0,
@@ -1079,8 +1472,16 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         drop_out,
         drop_in,
         perf: Perf { on: std::env::var_os("CHEBRIUM_PERF").is_some(), ..Default::default() },
-        last_trim: std::time::Instant::now(),
+        buffers: Vec::new(),
+        trim_wanted: false,
+        trim_armed: false,
+        look_watched: false,
         menu: None,
+        conn,
+        wl_compositor: compositor.wl_compositor().clone(),
+        subcompositor,
+        viewporter: viewporter_global,
+        under: None,
     };
     let (ping, source) = smithay_client_toolkit::reexports::calloop::ping::make_ping().expect("wake-up channel");
     loop_handle.insert_source(source, |_, _, rt: &mut Runtime<A>| rt.schedule()).expect("wake-up source");
@@ -1091,10 +1492,68 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         rt.menu = crate::appmenu::Client::connect(&config.app_id, move || waker.wake());
     }
     rt.app.start(Waker(ping));
+    rt.look_watched = watch_look(&loop_handle);
     while !rt.host.quit {
-        if event_loop.dispatch(Duration::from_millis(250), &mut rt).is_err() {
+        // with the appearance file watched, an idle program sleeps until something happens; otherwise it looks at the
+        // file four times a second
+        let timeout = if rt.look_watched { None } else { Some(Duration::from_millis(250)) };
+        if event_loop.dispatch(timeout, &mut rt).is_err() {
             break;
         }
-        rt.follow_look();
+        if !rt.look_watched {
+            rt.follow_look();
+        }
+    }
+}
+
+/// Watch the folder of the shell's appearance file with inotify, so a new look (or language) is followed the moment
+/// it is written instead of by asking the file four times a second. False when it cannot be watched (no folder yet).
+fn watch_look<A: App + 'static>(handle: &LoopHandle<'static, Runtime<A>>) -> bool {
+    use smithay_client_toolkit::reexports::calloop::generic::Generic;
+    use smithay_client_toolkit::reexports::calloop::{Interest, Mode, PostAction};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let path = Appearance::path();
+    let Some(dir) = path.parent() else { return false };
+    let Ok(cdir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+    // SAFETY: plain system calls; the descriptor is owned right away and closed on every failure path
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // the file may be rewritten in place or replaced by a rename: both, and its creation, are seen on the folder
+    let mask = libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_DELETE | libc::IN_ATTRIB;
+    // SAFETY: a valid descriptor and a NUL-terminated path
+    if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), cdir.as_ptr(), mask) } < 0 {
+        return false;
+    }
+    let source = Generic::new(fd, Interest::READ, Mode::Level);
+    handle
+        .insert_source(source, |_, fd, rt: &mut Runtime<A>| {
+            // drain the events: what changed does not matter, the file's stamp is compared
+            let mut buf = [0u8; 4096];
+            // SAFETY: reading into a buffer of the given length
+            while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+            rt.follow_look();
+            Ok(PostAction::Continue)
+        })
+        .is_ok()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::qwerty_letter;
+    #[test]
+    fn shortcut_keys_by_place() {
+        assert_eq!(qwerty_letter(47), Some('v'));
+        assert_eq!(qwerty_letter(46), Some('c'));
+        assert_eq!(qwerty_letter(45), Some('x'));
+        assert_eq!(qwerty_letter(30), Some('a'));
+        assert_eq!(qwerty_letter(44), Some('z'));
+        assert_eq!(qwerty_letter(21), Some('y'));
+        assert_eq!(qwerty_letter(1), None);
+        assert_eq!(qwerty_letter(51), None);
     }
 }

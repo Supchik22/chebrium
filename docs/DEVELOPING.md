@@ -84,7 +84,37 @@ Check with `grep '"name"' chebrium/src/lucide.rs`.
 
 `Form::new(x, y, content_width, pitch)` stacks rows: `slider(ui,label,&mut v,lo,hi,unit)`, `toggle`, `pick(ui,label,
 &mut v,&[(value,"name")])`, `stepper`, `text`, `note`, `skip(dy)`; fields `x y cw`. The composer also has local
-helpers (`swatch`, `pick`, `percent`, `section_icon`, `reset_link`, `fit`) in `src/bin/memrium_icons/main.rs`.
+helpers (`swatch`, `pick`, `percent`, `section_icon`, `reset_link`) in `src/bin/memrium_icons/main.rs`; `fit` is `chebrium::widgets::fit`.
+
+`ui.slider_bare(r, &mut v, min, max) -> dragging` is the slider without the number after it (true while held, so act
+on the release). For a widget of your own: `ui.grab(key, hot) -> held` claims the pointer for a drag (key with high
+bits, not a small `id`), `ui.grabbed(key)`, and `ui.recall(key)` reads a value kept with `ui.snap` (where a drag began).
+
+### Shared widgets (`chebrium::widgets`)
+
+Use these instead of drawing your own; they keep the programs alike.
+
+- **Scrolling.** `let s = widgets::scroll_area(ui, rect, content_h, &mut self.scroll);` takes the wheel/touchpad over
+  `rect` (used up only when it moved something), clamps `self.scroll` (the target, 0 = top; set it yourself to jump),
+  glides the shown offset, handles the bar (thin thumb at the right edge, widens on hover; drag it, or press beside it
+  to jump; hidden when everything fits; a press on it is not seen by the content) and **pushes a clip**. Draw the
+  content at `s.y(content_y)`, loop `for i in s.rows(row_h, n)` for uniform rows, light rows with `s.hit(ui, r)`,
+  then **`s.end(ui)`** (pops the clip, draws the bar on top). `.fence(ui)` after the call makes the widgets inside deaf
+  to a pointer outside the viewport (settings pages scrolling under a header). `s.offset` (shown), `s.max`, `s.scrolls()`.
+  `widgets::reveal(&mut offset, top, bottom, viewport_h)` keeps a keyboard cursor row in view. Leave `widgets::BAR_ZONE`
+  (12 px) at the right edge free of controls or accept that the bar sits over them.
+- `widgets::scrollbar(ui, track, content_h, viewport_h, &mut offset) -> dragging` is the bar alone, for views that
+  scroll their own way (bottom-anchored chat/history: convert `from_top = max - from_bottom`; a terminal's history).
+  `track = widgets::bar_track(viewport)`. Call it before the content so its press is not also the content's.
+- `widgets::list_row(ui, r, radius, key, hovered, selected)`: a row's background, accent 0.28 when selected, an eased
+  ink wash under the pointer.
+- `widgets::round_button(ui, cx, cy, "glyph", Round::ink(30.0).glyph(17.0).enabled(b)) -> pressed`: round icon
+  button with an eased wash; `Round::light(d)` is white for over pictures/film, `.alpha(a)` fades it (below 0.3 it
+  takes no presses), `.on(b)` puts it on the accent.
+- `widgets::seek_bar(ui, r, &mut v /*0..1*/, alpha, fill) -> Seek { hover, dragging, at }`: a seek line or volume over
+  a picture/film; the rail and knob grow under the pointer; `dragging` turning false is the release.
+- `widgets::fit(ui, text, size, bold, max_w)` / `fit_start(..)`: text cut with an ellipsis at the end / start.
+- `widgets::facts_panel(ui, x, y, w, &[("Name", value)])`: glass card of name/value lines (photo or film details).
 
 ## 5. Animation
 
@@ -133,7 +163,61 @@ pointing to a temp dir.
 - Examples: `cargo run --release --example glass_shot -- <icon> out.png`; chebrium gallery:
   `cargo run -p chebrium --example gallery -- . bench`. `CHEBRIUM_PERF=1` prints frame costs.
 
-## 10. Conventions
+## 10. GPU-heavy apps (pictures, video, camera)
+
+The toolkit itself is CPU-only: widgets, text and glass go through `SoftDraw` into a shared-memory buffer, so a plain
+app needs no GPU context. Big or fast-changing pixels (photo zoom/pan, video, a live camera preview) should not be
+pushed through that path; they go to the GPU through **one** mechanism, the picture layer (`src/layer.rs`, feature `gpu`).
+
+How it works
+- The runtime opens a subsurface *below* the window surface and wgpu presents to it (`GpuLayer`). Your toolkit pixels
+  stay on top; the window background is made see-through where the layer shows.
+- You do not touch wgpu. Each frame set `host.layer = Some(PictureLayer { pic: Arc<Pic>, dest, src, alpha, ground })`
+  (`dest` in logical window px, `src` = visible part in picture px, `ground` = opaque colour filling the window).
+  Only do it when `host.gpu_layer` is true; otherwise draw with `ui.picture(..)` / `Canvas::blit_pic` on the CPU.
+  Setting `host.layer = None` hides the layer. Reference use: `memrium_view` (`main.rs`, search `host.layer`).
+- Build a `Pic` with `Pic::from_bgra(w, h, data, opaque, mips)` (premultiplied BGRA) or `Pic::from_rgba`. `Pic::id` is the
+  identity: the GPU keeps the last 3 textures (`KEEP`) and re-uploads only when the id is new. `mips = true` for stills
+  (trilinear when shown small), `false` for video/camera frames (upload cost matters, they are shown near 1:1).
+- `render` skips drawing and presenting when pic id, size, rect, src, alpha and ground are unchanged.
+- Zoom is sampled bilinear, switching to nearest above 3x so pixels stay crisp; lod is picked from the on-screen scale.
+
+Device policy and switches
+- The adapter is requested with `PowerPreference::LowPower` (the integrated card): the layer only samples a texture, and
+  waking the dedicated GPU on a hybrid laptop for that would cost far more power than it saves. Heavy *compute* (see
+  `iconrender/gpu.rs` in the shell crate) is a separate decision with its own device choice.
+- `CHEBRIUM_NO_GPU=1` forces the CPU path. If device creation fails the runtime logs it, sets `host.gpu_layer = false`
+  and the app falls back by itself, so always keep the CPU path working and tested (the `Rig` in section 8 is CPU-only).
+- Surface format is non-sRGB on purpose: bytes go through unchanged, matching the CPU path.
+
+Live frames (camera, video) — `chebrium::live`
+- A capture thread builds `Frame::new(w, h, PixelFormat::{Bgra|Nv12|Yuyv}, Color::default(), bytes)` (tightly packed; `None`
+  if the length does not fit) and `Mailbox::put`s it, then `Waker::wake()` (keep the waker from `App::start`). The mailbox
+  holds only the newest frame, so a slow window drops stale ones (`Mailbox::dropped()` counts them) instead of queueing.
+- In `draw`: `if let Some(f) = mailbox.take() { self.frame = Some(f) }`, then
+  `host.live = Some(LiveLayer::fitted(frame, [0.0, 0.0, w, h], GROUND).mirrored(selfie))` when `host.gpu_layer`.
+  `LiveLayer` takes `dest`/`src`/`alpha`/`ground` like `PictureLayer`; `live::fit` letterboxes. Set `host.redraw = true`
+  while frames keep coming. `host.live` wins over `host.layer`.
+- On the card (`GpuLayer::render_live`): one texture set per format and size, kept across frames and written in place
+  (`Bgra8` / NV12 = `R8` + `Rg8` / YUYV = `Rgba8` at half width); YUV -> RGB runs in the shader. A frame already shown, in
+  the same place, costs nothing; a new size or format makes new textures. `Color { limited, bt709 }` picks range and matrix
+  (webcams: limited, BT.601 = the default; JPEG-style: `limited: false`).
+- Without a card (`gpu_layer` false) draw `ui.picture(.., &Arc::new(frame.to_pic()), ..)`; `to_pic` is the same
+  conversion on the processor and the reference the shader is checked against. Mirroring is card-only.
+- Live textures have no mips: a 1080p frame in a small window is sampled bilinear and can shimmer. YUYV is read with exact
+  texel loads (no chroma smoothing). NV12 chroma is sampled bilinear at its half-size grid, no siting correction.
+- Example: `cargo run -p chebrium --release --example live_frames` (`1/2/3` format, `m` mirror, `p` CPU path;
+  `LIVE_FORMAT`, `LIVE_CPU` for headless). Headless recipe:
+  `target/release/memrium_compositor --headless --exec 'env LIVE_FORMAT=nv12 <path>/live_frames' --shot out.png --after-ms 4000`.
+  Verified headless 2026-10-29: colour bars correct in all three formats; ~25 fps on the card vs ~17 fps on the processor
+  from a 60 fps source (the headless output is probably what caps it). Not checked in a live session.
+- Not done: dmabuf import from V4L2/PipeWire (frames are copied in), MJPEG decoding (do it on the capture thread, then hand
+  over YUV/BGRA), mips for downscaled frames, GPU-side effects (filters, crop, histogram), chroma siting, frame stride/padding
+  (frames must be tightly packed).
+- Keep capture and conversion off the UI thread. `CHEBRIUM_PERF=1` prints frame costs. A real-session check on the hybrid
+  laptop is still needed before calling a GPU path done (see the compositor notes about PRIME).
+
+## 11. Conventions
 
 - Docs and comments in English; talk to the user in Ukrainian.
 - Use only `ui.ink` / `ui.accent` / `ui.dark` for colours so every theme works; status colours excepted.

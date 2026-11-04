@@ -12,6 +12,8 @@
 //! * [`draw`], [`ui`], [`form`]: an immediate-mode widget kit (buttons, switches, sliders, segmented
 //!   controls, text fields, settings forms) written against the [`draw::Draw`] trait, so the same code
 //!   paints with the software canvas here ([`soft`]) or with the desktop's GPU glass renderer.
+//! * [`widgets`]: the pieces many programs share on top of those: scroll areas with a bar, list rows, round icon
+//!   buttons, text cut to fit, a details card.
 //! * [`app`]: the window runtime (Wayland, shared memory, frame callbacks): a program is one `App` impl and a
 //!   call to [`app::run`]. It redraws only on input and while something animates.
 //! * [`chrome`]: a header drawn in the desktop's style for programs that decorate their own windows.
@@ -36,8 +38,11 @@ pub mod form;
 pub mod glyphs;
 pub mod i18n;
 pub mod input;
+#[cfg(feature = "gpu")]
+pub mod layer;
 pub mod lucide;
 pub mod mem;
+pub mod live;
 pub mod picture;
 pub mod record;
 pub mod retro;
@@ -47,3 +52,4 @@ pub mod style;
 pub mod text;
 pub mod theme;
 pub mod ui;
+pub mod widgets;

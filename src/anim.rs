@@ -31,6 +31,11 @@ impl Anims {
         self.values.insert(key, value);
     }
 
+    /// The value under `key` as it stands, if it was ever set (a widget's own small memory, like where a drag began).
+    pub fn get(&self, key: u64) -> Option<f32> {
+        self.values.get(&key).copied()
+    }
+
     /// Forget everything (a page changed: its controls appear where they belong at once).
     pub fn clear(&mut self) {
         self.values.clear();
