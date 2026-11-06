@@ -116,6 +116,15 @@ Use these instead of drawing your own; they keep the programs alike.
 - `widgets::fit(ui, text, size, bold, max_w)` / `fit_start(..)`: text cut with an ellipsis at the end / start.
 - `widgets::facts_panel(ui, x, y, w, &[("Name", value)])`: glass card of name/value lines (photo or film details).
 
+### Context menus and drops
+
+`chebrium::popmenu::PopMenu::new(at, Vec<appmenu::Item>)` is a right-click menu drawn in the window (submenus on hover,
+keys, red `Item::danger()` entries). Open it from `App::raw_pointer` (button 0x111). Each frame: `let held = popmenu::shield(ui)`
+before the window's widgets (they go deaf), then `menu.draw(ui, held, size)` last -> `Outcome::{Open, Chosen(id), Closed}`;
+while it is open send keys to `PopMenu::key` first. `Host::drag_over` is where files dragged from another program are over
+the window (also set while `App::dropped` runs, so a drop can go to the row under it). `ui.edit_text(key)` reads a field's
+text while it is typed (a live filter). Reference: `src/bin/memrium_files`.
+
 ## 5. Animation
 
 - `ui.ease(key_u64, target, speed)` → current value (speed ~22 for hovers). Keys are yours; hash an id into them.

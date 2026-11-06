@@ -45,6 +45,8 @@ pub struct Appearance {
     /// the glass of the theme: rgb tint + strength, rgb + opacity of the border
     pub glass_tint: [f32; 4],
     pub glass_border: [f32; 4],
+    /// how the theme's glass is made: blur, refraction and bezel (logical px), dispersion, rim light, rim sharpness, saturation
+    pub glass_look: [f32; 7],
     /// "auto" or a language code
     pub language: String,
     /// how the controls look
@@ -55,7 +57,7 @@ pub struct Appearance {
 
 impl Default for Appearance {
     fn default() -> Appearance {
-        Appearance { dark: true, accent: [0.23, 0.55, 1.0], radius: 22.0, titlebar: 40.0, decor: Decor::Mac, opacity: 0.84, glass_tint: [0.73, 0.84, 0.92, 0.11], glass_border: [0.0, 0.0, 0.0, 0.05], language: "auto".into(), controls: crate::style::Controls::default(), menubar: false }
+        Appearance { dark: true, accent: [0.23, 0.55, 1.0], radius: 22.0, titlebar: 40.0, decor: Decor::Mac, opacity: 0.84, glass_tint: [0.73, 0.84, 0.92, 0.11], glass_border: [0.0, 0.0, 0.0, 0.05], glass_look: [5.0, 26.0, 24.0, 0.04, 0.85, 1.0, 1.22], language: "auto".into(), controls: crate::style::Controls::default(), menubar: false }
     }
 }
 
@@ -117,6 +119,9 @@ impl Appearance {
         }
         if let Some(v) = t.get("glass_border").and_then(floats::<4>) {
             a.glass_border = v;
+        }
+        if let Some(v) = t.get("glass_look").and_then(floats::<7>) {
+            a.glass_look = v;
         }
         if let Some(v) = t.get("language").and_then(|v| v.as_str()) {
             a.language = v.to_string();

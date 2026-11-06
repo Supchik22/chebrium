@@ -113,6 +113,12 @@ pub struct SoftDraw<'a, 'b> {
 }
 
 impl<'a, 'b> SoftDraw<'a, 'b> {
+    /// The shadow of a glass panel the card draws (see `Canvas::glass_shadow`).
+    pub fn glass_shadow(&mut self, r: [f32; 4], radius: f32, strength: f32) {
+        let r = self.rect(r);
+        self.canvas.glass_shadow(r[0], r[1], r[2], r[3], radius * self.scale, strength, self.scale);
+    }
+
     pub fn new(canvas: &'a mut Canvas<'b>, gfx: &'a mut Gfx) -> Self {
         SoftDraw { canvas, gfx, scale: 1.0, clips: Vec::new() }
     }

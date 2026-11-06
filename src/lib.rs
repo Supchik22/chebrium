@@ -14,6 +14,7 @@
 //!   paints with the software canvas here ([`soft`]) or with the desktop's GPU glass renderer.
 //! * [`widgets`]: the pieces many programs share on top of those: scroll areas with a bar, list rows, round icon
 //!   buttons, text cut to fit, a details card.
+//! * [`popmenu`]: a context menu drawn inside the window (right click), with submenus and keyboard use.
 //! * [`app`]: the window runtime (Wayland, shared memory, frame callbacks): a program is one `App` impl and a
 //!   call to [`app::run`]. It redraws only on input and while something animates.
 //! * [`chrome`]: a header drawn in the desktop's style for programs that decorate their own windows.
@@ -44,6 +45,8 @@ pub mod lucide;
 pub mod mem;
 pub mod live;
 pub mod picture;
+#[cfg(feature = "appmenu")]
+pub mod popmenu;
 pub mod record;
 pub mod retro;
 pub mod soft;

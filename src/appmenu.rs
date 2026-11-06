@@ -27,6 +27,8 @@ pub struct Item {
     /// below: only a menu the desktop reads from a program's own dbusmenu has them)
     pub icon: String,
     pub icon_png: Vec<u8>,
+    /// a destructive entry (Move to Trash): a menu drawn in the window lights it in red (not sent over the bus)
+    pub danger: bool,
 }
 
 impl Item {
@@ -62,6 +64,11 @@ impl Item {
     /// The icon of the entry, by its name in the icon theme.
     pub fn icon(mut self, name: &str) -> Item {
         self.icon = name.into();
+        self
+    }
+
+    pub fn danger(mut self) -> Item {
+        self.danger = true;
         self
     }
 }

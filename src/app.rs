@@ -23,7 +23,7 @@ use wayland_protocols::wp::{
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 use crate::input::{Key, KeyMods};
-use crate::record::{Frame, Recorder};
+use crate::record::{Cmd, Frame, GlassRect, Recorder};
 use crate::soft::Gfx;
 use crate::style::Style;
 use crate::theme::Appearance;
@@ -264,6 +264,9 @@ pub struct Host {
     pub start_drag: Option<DragOut>,
     /// a drag begun with `start_drag` is still going (set by the runtime; it goes false at the drop or a cancel)
     pub dragging: bool,
+    /// Something dragged from elsewhere (files, text) is over the window here (logical px; set by the runtime, None when
+    /// nothing is). While `App::dropped` runs it is where the drop happened, so a program can drop onto what is under it.
+    pub drag_over: Option<[f32; 2]>,
     /// the pointer shape to show (`None`: whatever the widgets under the pointer asked for)
     pub cursor: Option<crate::ui::Cursor>,
     /// A picture to show on the graphics card, under everything the program draws (set it every frame, only when
@@ -320,6 +323,12 @@ pub struct Waker(smithay_client_toolkit::reexports::calloop::ping::Ping);
 impl Waker {
     pub fn wake(&self) {
         self.0.ping();
+    }
+
+    /// A waker that wakes nothing, for a program without a window that runs the same capture code (the gesture service).
+    pub fn detached() -> Waker {
+        let (ping, _source) = smithay_client_toolkit::reexports::calloop::ping::make_ping().expect("wake-up channel");
+        Waker(ping)
     }
 }
 
@@ -461,8 +470,8 @@ struct Runtime<A: App> {
     paste_out: Outbox<String>,
     paste_in: Inbox<String>,
     /// what was dropped on the window: (files, text)
-    drop_out: Outbox<(Vec<std::path::PathBuf>, String)>,
-    drop_in: Inbox<(Vec<std::path::PathBuf>, String)>,
+    drop_out: Outbox<(Vec<std::path::PathBuf>, String, Option<[f32; 2]>)>,
+    drop_in: Inbox<(Vec<std::path::PathBuf>, String, Option<[f32; 2]>)>,
     perf: Perf,
     /// window buffers kept for the next frames (see `Kept`)
     buffers: Vec<Kept>,
@@ -738,7 +747,7 @@ impl<A: App + 'static> Runtime<A> {
     /// Show (or hide) the program's picture layer for a window of `w` x `h` device pixels. True when the layer is on screen:
     /// the window's own pixels must then leave it see-through.
     #[cfg(feature = "gpu")]
-    fn place_layer(&mut self, layer: Option<Layer>, w: usize, h: usize, fs: f32) -> bool {
+    fn place_layer(&mut self, layer: Option<Layer>, w: usize, h: usize, fs: f32, glass: &[GlassRect]) -> bool {
         let Some(l) = layer else {
             if let Some(u) = self.under.as_mut().filter(|u| u.shown) {
                 u.surface.attach(None, 0, 0);
@@ -773,8 +782,8 @@ impl<A: App + 'static> Runtime<A> {
         let Some(gpu) = u.gpu.as_mut() else { return false };
         let size = [w as u32, h as u32];
         let result = match &l {
-            Layer::Still(p) => gpu.render(size, fs, p),
-            Layer::Live(p) => gpu.render_live(size, fs, p),
+            Layer::Still(p) => gpu.render(size, fs, p, glass),
+            Layer::Live(p) => gpu.render_live(size, fs, p, glass),
         };
         match result {
             Ok(()) => {
@@ -791,7 +800,7 @@ impl<A: App + 'static> Runtime<A> {
     }
 
     #[cfg(not(feature = "gpu"))]
-    fn place_layer(&mut self, _: Option<Layer>, _: usize, _: usize, _: f32) -> bool {
+    fn place_layer(&mut self, _: Option<Layer>, _: usize, _: usize, _: f32, _: &[GlassRect]) -> bool {
         false
     }
 
@@ -807,8 +816,10 @@ impl<A: App + 'static> Runtime<A> {
                 self.app.clipboard(text, &mut self.host);
             }
         }
-        for (files, text) in self.drop_in.drain() {
+        for (files, text, at) in self.drop_in.drain() {
+            let over = std::mem::replace(&mut self.host.drag_over, at);
             self.app.dropped(files, text, &mut self.host);
+            self.host.drag_over = over;
         }
         if let Some(client) = &mut self.menu {
             for id in client.take() {
@@ -828,13 +839,39 @@ impl<A: App + 'static> Runtime<A> {
         let mut ui = Ui::new(&mut recorder, &mut self.state, style, dt);
         self.app.draw(&mut ui, [self.width as f32, self.height as f32], &mut self.host);
         let seen = ui.edit_seen;
-        let cmds = recorder.cmds;
+        let mut cmds = recorder.cmds;
         // a picture on the card goes under the window: its own pixels are left see-through for it
         let (still, live) = (self.host.layer.take(), self.host.live.take());
         let layer = live.map(Layer::Live).or(still.map(Layer::Still));
         let wanted = layer.is_some();
-        if self.place_layer(layer, w, h, fs) {
+        // glass over that picture is made by the card (the picture is not on the processor's canvas to blur and bend)
+        let dest = layer.as_ref().map(|l| match l {
+            Layer::Still(p) => p.dest,
+            Layer::Live(p) => p.dest,
+        });
+        let over = |r: &[f32; 4]| dest.is_some_and(|d| r[0] < d[0] + d[2] && r[0] + r[2] > d[0] && r[1] < d[1] + d[3] && r[1] + r[3] > d[1]);
+        let look = &self.host.appearance;
+        let glass: Vec<GlassRect> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::Glass { r, radius, strength, dark } if over(r) => {
+                    // the theme's tint is for the theme's own light or dark; the other one is the liquid default
+                    let tint = if *dark == look.dark { look.glass_tint } else if *dark { [0.08, 0.08, 0.09, 0.55] } else { [1.0, 1.0, 1.0, 0.12] };
+                    Some(GlassRect { r: *r, radius: *radius, strength: *strength, dark: *dark, look: look.glass_look, tint, border: look.glass_border })
+                }
+                _ => None,
+            })
+            .collect();
+        if self.place_layer(layer, w, h, fs, &glass) {
             bg_a = 0.0;
+            // only the shadow of those panels is painted here: their middle stays see-through for the card's glass
+            for c in cmds.iter_mut() {
+                if let Cmd::Glass { r, radius, strength, .. } = *c {
+                    if over(&r) {
+                        *c = Cmd::GlassShadow { r, radius, strength };
+                    }
+                }
+            }
         } else if wanted {
             // the card cannot do it: draw the frame again, the program puts the picture in itself now
             return self.draw();
@@ -1232,7 +1269,9 @@ impl<A: App + 'static> PointerHandler for Runtime<A> {
 
 impl<A: App + 'static> DataDeviceHandler for Runtime<A> {
     // a drag came over the window: take files (or text) as a copy
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64, _: &wl_surface::WlSurface) {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64, _: &wl_surface::WlSurface) {
+        self.host.drag_over = Some([x as f32, y as f32]);
+        self.schedule();
         let Some(offer) = self.data_device.as_ref().and_then(|dd| dd.data().drag_offer()) else { return };
         match drop_mime(&offer) {
             Some(mime) => {
@@ -1242,8 +1281,14 @@ impl<A: App + 'static> DataDeviceHandler for Runtime<A> {
             None => offer.accept_mime_type(offer.serial, None),
         }
     }
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        self.host.drag_over = None;
+        self.schedule();
+    }
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
+        self.host.drag_over = Some([x as f32, y as f32]);
+        self.schedule();
+    }
     // the compositor also reports our own `set_selection` back here, so this cannot tell that someone else took the
     // clipboard (dropping the source then destroyed our own copy: a paste found nothing); `cancelled` says that
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
@@ -1252,14 +1297,15 @@ impl<A: App + 'static> DataDeviceHandler for Runtime<A> {
         let Some(mime) = drop_mime(&offer) else { return };
         let Ok(mut pipe) = offer.receive(mime.clone()) else { return };
         let out = self.drop_out.clone();
+        let at = self.host.drag_over;
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if pipe.read_to_end(&mut buf).is_ok() {
                 let text = String::from_utf8_lossy(&buf).into_owned();
                 if mime == "text/uri-list" {
-                    out.send((text.lines().filter_map(file_from_uri).collect(), String::new()));
+                    out.send((text.lines().filter_map(file_from_uri).collect(), String::new(), at));
                 } else {
-                    out.send((Vec::new(), text));
+                    out.send((Vec::new(), text, at));
                 }
             }
             offer.finish();
@@ -1400,7 +1446,7 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
     let shm = Shm::bind(&globals, &qh).expect("wl_shm");
     let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).expect("wl_data_device_manager");
     let (paste_out, paste_in) = channel::<String>();
-    let (drop_out, drop_in) = channel::<(Vec<std::path::PathBuf>, String)>();
+    let (drop_out, drop_in) = channel::<(Vec<std::path::PathBuf>, String, Option<[f32; 2]>)>();
     let surface = compositor.create_surface(&qh);
     // the compositor draws the frame, so the program only paints its content
     let decorations = match config.decorations {

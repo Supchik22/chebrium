@@ -300,6 +300,17 @@ impl<'a> Ui<'a> {
     }
 
     /// Is some text field being edited?
+    /// The text of field `key` as it is being typed (None when that field is not being edited): a filter that narrows
+    /// a list with every letter reads it, while `text_field` itself hands the text over only on Enter.
+    pub fn edit_text(&self, key: &str) -> Option<&str> {
+        self.edit.as_ref().filter(|(k, _)| k == key).map(|(_, t)| t.as_str())
+    }
+
+    /// Stop editing whatever field is being edited, keeping its old value (the program moved on: another folder).
+    pub fn end_edit(&mut self) {
+        *self.edit = None;
+    }
+
     pub fn editing(&self) -> bool {
         self.edit.is_some()
     }
@@ -632,7 +643,8 @@ impl<'a> Ui<'a> {
             }
             return;
         }
-        let (bed, a) = if self.dark { ([0.0, 0.0, 0.0], 0.34) } else { (self.ink, 0.17) };
+        // (in the dark a pale bed: a black one disappears into a dark card, and an off switch could not be seen)
+        let (bed, a) = if self.dark { ([1.0, 1.0, 1.0], 0.16) } else { (self.ink, 0.17) };
         self.fill(r, radius, bed, a);
         if filled > 0.0 {
             self.fill(r, radius, self.accent_now(), filled);

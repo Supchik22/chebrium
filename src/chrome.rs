@@ -20,6 +20,16 @@ enum Button {
     Maximize,
 }
 
+/// How much of the top row the window's buttons take at its left and at its right end (logical px) in the desktop's
+/// style, as [`integrated`] lays them out: a toolbar in that row starts and ends clear of them.
+pub fn button_room(host: &Host) -> [f32; 2] {
+    match host.appearance.decor {
+        Decor::Mac => [20.0 + 2.0 * 21.0 + 16.0 + 14.0, 0.0],
+        Decor::Gnome => [0.0, 12.0 + 24.0 + 2.0 * 32.0 + 10.0],
+        _ => [0.0, 3.0 * 46.0 + 6.0],
+    }
+}
+
 /// The buttons of the window in the desktop's style, laid out from the window's `x0..x1` and centred on `cy`. `alpha` fades
 /// them (an overlay that hides). Returns true when a press was on one of them.
 pub fn controls(ui: &mut Ui<'_>, host: &mut Host, x0: f32, x1: f32, cy: f32, alpha: f32) -> bool {

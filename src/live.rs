@@ -129,6 +129,23 @@ fn yuv_to_bgr(y: u8, u: u8, v: u8, c: Color) -> [u8; 3] {
     [q(b), q(g), q(r)]
 }
 
+/// A correction the card applies to a live picture as it draws it: white balance, levels, a lift of the middle tones,
+/// colour and sharpness. The program works the numbers out (from what the camera sees) and may change them every frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grade {
+    /// a gain for red, green and blue (white balance and exposure)
+    pub gain: [f32; 3],
+    /// the middle tones are raised by this power (1 leaves them, below 1 brightens)
+    pub gamma: f32,
+    /// the levels: what is at or below `black` becomes black, what is at or above `white` becomes white (0..1)
+    pub black: f32,
+    pub white: f32,
+    /// the strength of the unsharp mask (0 off)
+    pub sharpen: f32,
+    /// 1 leaves the colour as it is
+    pub saturation: f32,
+}
+
 /// A live frame on the card, under the window's controls (see `Host::live`). Like `PictureLayer`, but the source is a
 /// [`Frame`] whose texture is updated in place.
 #[derive(Clone, Debug)]
@@ -143,6 +160,8 @@ pub struct LiveLayer {
     pub ground: [f32; 3],
     /// flip left and right, as a selfie preview does
     pub mirror: bool,
+    /// a correction applied as it is drawn (none: the picture as the camera sends it)
+    pub grade: Option<Grade>,
 }
 
 impl LiveLayer {
@@ -150,7 +169,13 @@ impl LiveLayer {
     /// the window shows `ground`.
     pub fn fitted(frame: Arc<Frame>, area: [f32; 4], ground: [f32; 3]) -> LiveLayer {
         let dest = fit(frame.w as f32, frame.h as f32, area);
-        LiveLayer { src: [0.0, 0.0, frame.w as f32, frame.h as f32], frame, dest, alpha: 1.0, ground, mirror: false }
+        LiveLayer { src: [0.0, 0.0, frame.w as f32, frame.h as f32], frame, dest, alpha: 1.0, ground, mirror: false, grade: None }
+    }
+
+    /// The same layer drawn with a correction.
+    pub fn graded(mut self, grade: Option<Grade>) -> LiveLayer {
+        self.grade = grade;
+        self
     }
 
     /// The same layer showing the frame as a mirror would.

@@ -22,8 +22,23 @@ pub enum Cmd {
     PopClip,
     /// glass reads the pixels around it, so it is repainted whenever anything under or near it is
     Glass { r: [f32; 4], radius: f32, strength: f32, dark: bool },
+    /// the glass is made by the graphics card, over its picture: only the shadow around it is painted here
+    GlassShadow { r: [f32; 4], radius: f32, strength: f32 },
     /// a picture: the same one (by id) at the same place is the same command, so a still picture costs nothing to keep
     Picture { r: [f32; 4], pic: std::sync::Arc<crate::picture::Pic>, src: [f32; 4], alpha: f32 },
+}
+
+/// A panel of glass the graphics card draws over its picture (`GpuLayer`): where, how round, how strong, in the dark look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassRect {
+    pub r: [f32; 4],
+    pub radius: f32,
+    pub strength: f32,
+    pub dark: bool,
+    /// the theme's glass (`Appearance::glass_look`), its tint for this look and its border
+    pub look: [f32; 7],
+    pub tint: [f32; 4],
+    pub border: [f32; 4],
 }
 
 /// A painter that only remembers what it is asked to draw.
@@ -95,6 +110,11 @@ fn bounds(cmd: &Cmd, gfx: &mut Gfx, s: f32) -> Box4 {
     let rect = |r: &[f32; 4]| [(r[0] * s).floor() as i32 - 2, (r[1] * s).floor() as i32 - 2, ((r[0] + r[2]) * s).ceil() as i32 + 2, ((r[1] + r[3]) * s).ceil() as i32 + 2];
     match cmd {
         Cmd::Fill { r, .. } | Cmd::Grad { r, .. } | Cmd::Picture { r, .. } => rect(r),
+        // (the shadow reaches a few pixels beyond the panel, and moves with it: painted over the old shadow's place)
+        Cmd::GlassShadow { r, .. } => {
+            let m = 10.0 * s;
+            [(r[0] * s - m).floor() as i32, (r[1] * s - m).floor() as i32, ((r[0] + r[2]) * s + m).ceil() as i32, ((r[1] + r[3]) * s + m).ceil() as i32]
+        }
         // the blur reads a margin around the panel
         Cmd::Glass { r, .. } => {
             let m = 12.0 * s;
@@ -127,6 +147,7 @@ fn paint(cmd: &Cmd, d: &mut SoftDraw) {
         Cmd::Text { x, y, text, size, bold, c, alpha, align } => d.text(*x, *y, text, *size, *bold, *c, *alpha, *align),
         Cmd::Picture { r, pic, src, alpha } => d.picture(*r, pic, *src, *alpha),
         Cmd::Glass { r, radius, strength, dark } => d.glass(*r, *radius, *strength, *dark),
+        Cmd::GlassShadow { r, radius, strength } => d.glass_shadow(*r, *radius, *strength),
         Cmd::PushClip { r } => d.push_clip(*r),
         Cmd::PopClip => d.pop_clip(),
     }

@@ -27,18 +27,28 @@ impl Form {
         self.y += self.pitch;
     }
 
+    /// A slider whose value is written by `text` ("Off" at nothing, a unit, a rounding).
+    pub fn slider_text(&mut self, ui: &mut Ui<'_>, label: &str, v: &mut f32, lo: f32, hi: f32, text: &dyn Fn(f32) -> String) {
+        ui.row(self.x, self.y, label);
+        let r = [self.x + 150.0, self.y - 9.0, self.cw - 230.0, 18.0];
+        ui.slider_bare(r, v, lo, hi);
+        ui.text_raw(r[0] + r[2] + 18.0, self.y + 4.5, &text(*v), 12.0, false, ui.ink, 0.7, Align::Left);
+        self.y += self.pitch;
+    }
+
     pub fn toggle(&mut self, ui: &mut Ui<'_>, label: &str, v: &mut bool) {
         ui.row(self.x, self.y, label);
         ui.toggle(self.x + self.cw - 44.0, self.y - 12.0, v);
         self.y += self.pitch;
     }
 
-    /// A segmented control over the values of `opts`; true when the choice changed.
+    /// A segmented control over the values of `opts`; true when the choice changed. It fills the control column (from
+    /// where the sliders start to the right edge), so every row of a page lines up whatever the number of choices.
     pub fn pick<T: Copy + PartialEq>(&mut self, ui: &mut Ui<'_>, label: &str, v: &mut T, opts: &[(T, &str)]) -> bool {
         ui.row(self.x, self.y, label);
         let names: Vec<&str> = opts.iter().map(|o| o.1).collect();
         let mut sel = opts.iter().position(|o| o.0 == *v).unwrap_or(0);
-        let w = (self.cw - 150.0).min(120.0 * opts.len() as f32);
+        let w = (self.cw - 150.0).max(60.0 * opts.len() as f32);
         let changed = ui.segmented([self.x + self.cw - w, self.y - 15.0, w, 30.0], &names, &mut sel);
         if changed {
             *v = opts[sel].0;

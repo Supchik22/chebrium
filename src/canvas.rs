@@ -308,6 +308,52 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Only the soft shadow of a glass panel, in the ring around it (the panel itself is left as it is). Glass over a
+    /// picture the graphics card draws is made there (`layer.rs`): the pixels of the picture are not on this canvas, and
+    /// the panel must stay see-through for the card's version to show.
+    pub fn glass_shadow(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, strength: f32, scale: f32) {
+        let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+        let r = r.min(hw).min(hh);
+        let clip = self.clip;
+        let (bx0, by0) = ((x.floor() as i32).max(clip[0]), (y.floor() as i32).max(clip[1]));
+        let (bx1, by1) = (((x + w).ceil() as i32).min(clip[2]), ((y + h).ceil() as i32).min(clip[3]));
+        let strength = strength.clamp(0.0, 1.5);
+        if bx0 >= bx1 || by0 >= by1 || strength <= 0.01 {
+            return;
+        }
+        let (data, stride) = (&mut *self.data, self.w);
+        let sm = (6.0 * scale).ceil() as i32;
+        let off = 2.0 * scale;
+        let (sx0, sx1) = ((bx0 - sm).max(clip[0]), (bx1 + sm).min(clip[2]));
+        let (sy0, sy1) = ((by0 - sm).max(clip[1]), (by1 + sm + off.ceil() as i32).min(clip[3]));
+        for py in sy0..sy1 {
+            let fy = py as f32 + 0.5;
+            let dy = (fy - cy).abs();
+            // along a row the glass covers a known stretch; the shadow is only outside it
+            let (s0, s1) = if dy < hh {
+                let over = dy - (hh - r);
+                let half = if over > 0.0 { hw - r + (r * r - over * over).max(0.0).sqrt() } else { hw };
+                (((cx - half + 1.0).ceil() as i32).clamp(sx0, sx1), ((cx + half - 1.0).floor() as i32).clamp(sx0, sx1))
+            } else {
+                (sx1, sx1)
+            };
+            for px in (sx0..s0).chain(s1..sx1) {
+                let fx = px as f32 + 0.5;
+                let d = sd_round_rect(fx, fy - off, cx, cy, hw, hh, r);
+                if d >= sm as f32 {
+                    continue;
+                }
+                let t = 1.0 - d.max(0.0) / sm as f32;
+                let a = 0.30 * strength * t * t;
+                let i = (py as usize * stride + px as usize) * 4;
+                for k in 0..3 {
+                    data[i + k] = (data[i + k] as f32 * (1.0 - a) + 0.5) as u8;
+                }
+                data[i + 3] = (255.0 * a + data[i + 3] as f32 * (1.0 - a) + 0.5) as u8;
+            }
+        }
+    }
+
     /// Liquid glass over what is already painted: the pixels under the rounded rectangle are blurred, bent at the
     /// rim like a lens, tinted and given a lit edge. `scale` is the HiDPI factor of the canvas.
     ///

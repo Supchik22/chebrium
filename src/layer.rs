@@ -11,6 +11,7 @@
 //! `CHEBRIUM_NO_GPU=1` keeps the picture on the processor.
 
 use crate::live::{Frame, LiveLayer, PixelFormat};
+use crate::record::GlassRect;
 use crate::picture::{PictureLayer, Pic};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -27,6 +28,21 @@ struct Params {
     nearest: u32,
     mode: u32,
     flags: u32,
+    // where the picture is drawn (px), the ground colour, a glass panel's [radius px, strength, dark, scale], the picture's
+    // [highest mip level, screen px per texel], and the panel's [centre x, centre y, half width, half height] (px)
+    pic: vec4<f32>,
+    ground: vec4<f32>,
+    glass: vec4<f32>,
+    gfx: vec4<f32>,
+    bx: vec4<f32>,
+    // the theme's glass: [blur, refraction, bezel, dispersion], [rim, rim sharpness, saturation, -], tint, border
+    look: vec4<f32>,
+    look2: vec4<f32>,
+    tint: vec4<f32>,
+    border: vec4<f32>,
+    // a correction (flags bit 2): [gain r, gain g, gain b, gamma], [black, white, sharpen, saturation]
+    grade: vec4<f32>,
+    grade2: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -86,10 +102,158 @@ fn fs(v: V) -> @location(0) vec4<f32> {
     } else {
         c = textureSampleLevel(tex, smooth_s, v.uv, p.lod);
     }
+    if (p.flags & 4u) != 0u {
+        c = vec4(graded_sharp(v.uv, c.rgb), c.a);
+    }
     // premultiplied, thinned out by the picture's own opacity
     return c * p.alpha;
 }
-";
+
+// the correction: white balance and exposure by a gain per channel, the levels, the middle tones lifted, the colour
+fn grade(c: vec3<f32>) -> vec3<f32> {
+    var x = c * p.grade.xyz;
+    x = clamp((x - vec3(p.grade2.x)) / max(p.grade2.y - p.grade2.x, 0.05), vec3(0.0), vec3(1.0));
+    x = pow(x, vec3(max(p.grade.w, 0.05)));
+    let l = dot(x, vec3(0.299, 0.587, 0.114));
+    return clamp(mix(vec3(l), x, p.grade2.w), vec3(0.0), vec3(1.0));
+}
+
+// one texel in uv units (a YUYV texel holds two pixels across)
+fn texel_step() -> vec2<f32> {
+    let d = vec2<f32>(textureDimensions(tex));
+    return select(1.0 / d, vec2(0.5 / d.x, 1.0 / d.y), p.mode == 2u);
+}
+
+// the correction and, over it, an unsharp mask (the picture less its blur, added back)
+fn graded_sharp(uv: vec2<f32>, c: vec3<f32>) -> vec3<f32> {
+    let t = texel_step();
+    let b = (raw_rgb(uv + vec2(t.x, 0.0), 0.0, false) + raw_rgb(uv - vec2(t.x, 0.0), 0.0, false) + raw_rgb(uv + vec2(0.0, t.y), 0.0, false) + raw_rgb(uv - vec2(0.0, t.y), 0.0, false)) * 0.25;
+    let g = grade(c);
+    return clamp(g + (g - grade(b)) * p.grade2.z, vec3(0.0), vec3(1.0));
+}
+"; // (the glass half of the shader follows)
+
+const SHADER_GLASS: &str = r#"
+// ---- glass over the picture: the same lens, blur, tint and lit rim as `Canvas::glass_round_rect`, made here because the
+// picture is not on the processor's canvas. Drawn as a quad over each panel, after the picture.
+
+// the picture's colour at a place on the screen (px); the ground beyond its edges
+fn raw_rgb(uv: vec2<f32>, lod: f32, crisp: bool) -> vec3<f32> {
+    if p.mode == 1u {
+        let y = textureSampleLevel(tex, smooth_s, uv, 0.0).r;
+        let c = textureSampleLevel(tex2, smooth_s, uv, 0.0).rg;
+        return yuv(y, c.x, c.y);
+    } else if p.mode == 2u {
+        let d = textureDimensions(tex);
+        let ix = clamp(i32(floor(uv.x * f32(d.x * 2u))), 0, i32(d.x * 2u) - 1);
+        let iy = clamp(i32(floor(uv.y * f32(d.y))), 0, i32(d.y) - 1);
+        let t = textureLoad(tex, vec2<i32>(ix / 2, iy), 0);
+        return yuv(select(t.r, t.b, (ix % 2) == 1), t.g, t.a);
+    }
+    if crisp {
+        return textureSampleLevel(tex, crisp_s, uv, 0.0).rgb;
+    }
+    return textureSampleLevel(tex, smooth_s, uv, lod).rgb;
+}
+
+fn pic_rgb(uv: vec2<f32>, lod: f32, crisp: bool) -> vec3<f32> {
+    let c = raw_rgb(uv, lod, crisp);
+    if (p.flags & 4u) != 0u {
+        return grade(c);
+    }
+    return c;
+}
+
+fn pic_at(pos: vec2<f32>, lod: f32, crisp: bool) -> vec3<f32> {
+    let c = (pos - p.pic.xy) / p.pic.zw;
+    if c.x < 0.0 || c.y < 0.0 || c.x > 1.0 || c.y > 1.0 {
+        return p.ground.rgb;
+    }
+    return pic_rgb(mix(p.uv.xy, p.uv.zw, c), lod, crisp);
+}
+
+// a soft blur: a golden-angle spiral of taps, from the mip level whose texels are about as far apart as the taps
+fn blur_px(pos: vec2<f32>, radius: f32) -> vec3<f32> {
+    let k = max(p.gfx.y, 0.0001);
+    let lod = clamp(log2(max(0.36 * radius / k, 1.0)), p.lod, max(p.gfx.x, p.lod));
+    var acc = vec3<f32>(0.0);
+    for (var i = 0; i < 16; i = i + 1) {
+        let a = f32(i) * 2.39996323;
+        let r = radius * sqrt((f32(i) + 0.5) / 16.0);
+        acc += pic_at(pos + vec2(cos(a), sin(a)) * r, lod, false);
+    }
+    return acc / 16.0;
+}
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// the shell's convex-lens height profile (glass.wgsl): 0 at the outer edge, 1 at the inner bezel limit
+fn lens(t: f32) -> f32 {
+    let u = clamp(t, 0.0, 1.0);
+    return sqrt(1.0 - (1.0 - u) * (1.0 - u));
+}
+
+// The same glass as the shell's (`shade_glass` in glass.wgsl, its liquid look): the backdrop bent in a band at the edge
+// by the lens, with a little colour dispersion, blurred, saturated, tinted; lit from above by a crisp rim.
+@fragment
+fn fs_glass(v: V) -> @location(0) vec4<f32> {
+    let pos = v.pos.xy;
+    let hf = p.bx.zw;
+    let r = min(p.glass.x, min(hf.x, hf.y));
+    let d0 = pos - p.bx.xy;
+    let q = abs(d0) - hf + vec2(r);
+    let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let fade = clamp(p.glass.y, 0.0, 1.0);
+    let cov = clamp(0.5 - d, 0.0, 1.0) * fade;
+    if cov <= 0.0 {
+        return vec4(0.0);
+    }
+    let sc = p.glass.w;
+    let depth = -d;
+    // the outward normal of the rounded rectangle
+    var n = vec2(0.0, sign(d0.y));
+    if q.x > 0.0 && q.y > 0.0 {
+        n = q / length(q) * sign(d0);
+    } else if q.x > q.y {
+        n = vec2(sign(d0.x), 0.0);
+    }
+    // liquid glass bends the scene only in a band at the rim: at most 45 % of the short side
+    let short_side = min(hf.x, hf.y) * 2.0;
+    let bezel = min(min(p.look.z * sc, short_side * 0.5), short_side * 0.45);
+    let refr = min(p.look.y * sc, min(bezel * 1.15, short_side * 0.45));
+    let t = depth / max(bezel, 1.0);
+    // (the square of the distance to the band's inner limit: the convex-lens profile bends only the last pixel or two)
+    let k = 1.0 - clamp(t, 0.0, 1.0);
+    let k2 = select(0.0, k * k, t < 1.0);
+    let disp = -n * k2 * refr;
+    // the bend shows only where there is something to bend: the blur is mostly taken off in the band at the rim
+    let blur_r = max(p.look.x * sc * 1.1 * (1.0 - 0.8 * k2), 1.0);
+    var col = blur_px(pos + disp, blur_r);
+    if k2 > 0.0001 && p.look.w >= 0.001 {
+        col.r = blur_px(pos + disp * (1.0 + p.look.w), blur_r).r;
+        col.b = blur_px(pos + disp * (1.0 - p.look.w), blur_r).b;
+    }
+    col = mix(vec3(luma(col)), col, select(p.look2.z, 1.15, p.look2.z <= 0.0));
+    col = mix(col, p.tint.rgb, p.tint.a) + vec3(0.015);
+    // the rim: a crisp bright line along the top edge, a fainter one along the bottom, the sides almost dark
+    let dl = depth / sc;
+    if dl < 40.0 {
+        let nd = dot(n, normalize(vec2(-0.22, -1.0)));
+        let edge = exp(-dl / 0.6);
+        let inner = exp(-dl / 3.2);
+        let top = pow(max(nd, 0.0), 2.2);
+        let bottom = pow(max(-nd, 0.0), 3.0) * 0.42;
+        let rim_k = mix(1.0, 0.45, smoothstep(0.45, 0.9, luma(col)));
+        col += vec3(1.0) * rim_k * (edge * (0.10 + 0.85 * (top + bottom)) + inner * 0.10 * top) * p.look2.x;
+    }
+    // a 1px inner border in the theme's border colour
+    let band = 1.0 - smoothstep(0.0, 1.5, dl);
+    col = mix(col, p.border.rgb, p.border.a * band);
+    return vec4(clamp(col, vec3(0.0), vec3(1.0)) * cov, cov);
+}
+"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -104,6 +268,17 @@ struct Params {
     mode: u32,
     flags: u32,
     _pad: u32,
+    pic: [f32; 4],
+    ground: [f32; 4],
+    glass: [f32; 4],
+    gfx: [f32; 4],
+    bx: [f32; 4],
+    look: [f32; 4],
+    look2: [f32; 4],
+    tint: [f32; 4],
+    border: [f32; 4],
+    grade: [f32; 4],
+    grade2: [f32; 4],
 }
 
 /// What was drawn last: when nothing differs, the frame is not drawn again.
@@ -117,6 +292,7 @@ struct Drawn {
     src: [f32; 4],
     alpha: f32,
     ground: [f32; 3],
+    grade: Option<crate::live::Grade>,
 }
 
 /// The textures a live frame is written into: the same ones for every frame of a format and size.
@@ -146,6 +322,10 @@ pub struct GpuLayer {
     config: wgpu::SurfaceConfiguration,
     configured: [u32; 2],
     pipeline: wgpu::RenderPipeline,
+    /// the glass panels over the picture (see `SHADER_GLASS`)
+    glass_pipeline: wgpu::RenderPipeline,
+    /// the panels drawn last, with `drawn`
+    drawn_glass: Vec<GlassRect>,
     layout: wgpu::BindGroupLayout,
     smooth: wgpu::Sampler,
     crisp: wgpu::Sampler,
@@ -200,14 +380,14 @@ impl GpuLayer {
             view_formats: vec![],
         };
 
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("picture"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("picture"), source: wgpu::ShaderSource::Wgsl(format!("{SHADER}{SHADER_GLASS}").into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("picture"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) },
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<Params>() as u64) },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -243,6 +423,22 @@ impl GpuLayer {
             multiview: None,
             cache: None,
         });
+        let glass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("glass over the picture"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_glass"),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
         let sampler = |filter| device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: filter, min_filter: filter, mipmap_filter: filter, ..Default::default() });
         let (smooth, crisp) = (sampler(wgpu::FilterMode::Linear), sampler(wgpu::FilterMode::Nearest));
         let dummy = device
@@ -257,7 +453,7 @@ impl GpuLayer {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        Ok(GpuLayer { surface: surf, device, queue, config, configured: [0, 0], pipeline, layout, smooth, crisp, textures: Vec::new(), live: None, dummy, max_side, frame: 0, drawn: None })
+        Ok(GpuLayer { surface: surf, device, queue, config, configured: [0, 0], pipeline, glass_pipeline, drawn_glass: Vec::new(), layout, smooth, crisp, textures: Vec::new(), live: None, dummy, max_side, frame: 0, drawn: None })
     }
 
     /// Put the picture on the card (once per picture); the index of its texture.
@@ -311,10 +507,10 @@ impl GpuLayer {
 
     /// Draw the layer for a window of `size` device pixels at `scale` device pixels per logical one. Nothing is drawn (and
     /// nothing presented) when it looks as it did last time.
-    pub fn render(&mut self, size: [u32; 2], scale: f32, l: &PictureLayer) -> Result<(), String> {
+    pub fn render(&mut self, size: [u32; 2], scale: f32, l: &PictureLayer, glass: &[GlassRect]) -> Result<(), String> {
         let rect = [l.dest[0] * scale, l.dest[1] * scale, l.dest[2] * scale, l.dest[3] * scale];
-        let now = Drawn { live: false, mirror: false, pic: l.pic.id, size, rect, src: l.src, alpha: l.alpha, ground: l.ground };
-        if self.drawn == Some(now) {
+        let now = Drawn { live: false, mirror: false, pic: l.pic.id, size, rect, src: l.src, alpha: l.alpha, ground: l.ground, grade: None };
+        if self.drawn == Some(now) && self.drawn_glass == glass {
             return Ok(());
         }
         let index = self.upload(&l.pic)?;
@@ -335,9 +531,21 @@ impl GpuLayer {
             mode: 0,
             flags: 0,
             _pad: 0,
+            pic: rect,
+            ground: [l.ground[0], l.ground[1], l.ground[2], 1.0],
+            glass: [0.0; 4],
+            gfx: [(tex.mips - 1) as f32, k, 0.0, 0.0],
+            bx: [0.0; 4],
+            look: [0.0; 4],
+            look2: [0.0; 4],
+            tint: [0.0; 4],
+            border: [0.0; 4],
+            grade: [1.0, 1.0, 1.0, 1.0],
+            grade2: [0.0, 1.0, 0.0, 1.0],
         };
-        self.paint(params, &tex.view, &self.dummy, l.ground)?;
+        self.paint(params, &tex.view, &self.dummy, l.ground, glass, scale)?;
         self.drawn = Some(now);
+        self.drawn_glass = glass.to_vec();
         Ok(())
     }
 
@@ -401,11 +609,11 @@ impl GpuLayer {
 
     /// Draw a live frame, like [`GpuLayer::render`] draws a picture. The frame goes into textures that stay on the card;
     /// a frame already shown, in the same place, costs nothing.
-    pub fn render_live(&mut self, size: [u32; 2], scale: f32, l: &LiveLayer) -> Result<(), String> {
+    pub fn render_live(&mut self, size: [u32; 2], scale: f32, l: &LiveLayer, glass: &[GlassRect]) -> Result<(), String> {
         let f = &l.frame;
         let rect = [l.dest[0] * scale, l.dest[1] * scale, l.dest[2] * scale, l.dest[3] * scale];
-        let now = Drawn { live: true, mirror: l.mirror, pic: f.id, size, rect, src: l.src, alpha: l.alpha, ground: l.ground };
-        if self.drawn == Some(now) {
+        let now = Drawn { live: true, mirror: l.mirror, pic: f.id, size, rect, src: l.src, alpha: l.alpha, ground: l.ground, grade: l.grade };
+        if self.drawn == Some(now) && self.drawn_glass == glass {
             return Ok(());
         }
         self.live_textures(f)?;
@@ -418,7 +626,7 @@ impl GpuLayer {
             std::mem::swap(&mut u0, &mut u1);
         }
         let k = (l.dest[2] / l.src[2].max(1e-6) * scale).min(l.dest[3] / l.src[3].max(1e-6) * scale);
-        let params = Params {
+        let mut params = Params {
             rect,
             uv: [u0, l.src[1] / fh, u1, (l.src[1] + l.src[3]) / fh],
             view: [size[0] as f32, size[1] as f32],
@@ -430,22 +638,58 @@ impl GpuLayer {
                 PixelFormat::Nv12 => 1,
                 PixelFormat::Yuyv => 2,
             },
-            flags: f.color.limited as u32 | (f.color.bt709 as u32) << 1,
+            flags: f.color.limited as u32 | (f.color.bt709 as u32) << 1 | if l.grade.is_some() { 4 } else { 0 },
             _pad: 0,
+            pic: rect,
+            ground: [l.ground[0], l.ground[1], l.ground[2], 1.0],
+            glass: [0.0; 4],
+            gfx: [0.0, k, 0.0, 0.0],
+            bx: [0.0; 4],
+            look: [0.0; 4],
+            look2: [0.0; 4],
+            tint: [0.0; 4],
+            border: [0.0; 4],
+            grade: [1.0, 1.0, 1.0, 1.0],
+            grade2: [0.0, 1.0, 0.0, 1.0],
         };
-        self.paint(params, &t.main_view, t.chroma_view.as_ref().unwrap_or(&self.dummy), l.ground)?;
+        if let Some(g) = l.grade {
+            params.grade = [g.gain[0], g.gain[1], g.gain[2], g.gamma];
+            params.grade2 = [g.black, g.white, g.sharpen, g.saturation];
+        }
+        self.paint(params, &t.main_view, t.chroma_view.as_ref().unwrap_or(&self.dummy), l.ground, glass, scale)?;
         self.drawn = Some(now);
+        self.drawn_glass = glass.to_vec();
         Ok(())
     }
 
-    /// One textured quad over the ground colour, presented.
-    fn paint(&self, params: Params, main: &wgpu::TextureView, chroma: &wgpu::TextureView, ground: [f32; 3]) -> Result<(), String> {
-        let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("picture"), contents: bytemuck::bytes_of(&params), usage: wgpu::BufferUsages::UNIFORM });
+    /// One textured quad over the ground colour and, over it, a panel of glass for each of `glass` (logical px, `scale`
+    /// device px each), presented.
+    fn paint(&self, params: Params, main: &wgpu::TextureView, chroma: &wgpu::TextureView, ground: [f32; 3], glass: &[GlassRect], scale: f32) -> Result<(), String> {
+        // one uniform block per draw, in one buffer, picked with a dynamic offset
+        let size = std::mem::size_of::<Params>();
+        let align = self.device.limits().min_uniform_buffer_offset_alignment as usize;
+        let stride = size.div_ceil(align) * align;
+        let mut bytes = vec![0u8; stride * (1 + glass.len())];
+        bytes[..size].copy_from_slice(bytemuck::bytes_of(&params));
+        for (i, g) in glass.iter().enumerate() {
+            let px = [g.r[0] * scale, g.r[1] * scale, g.r[2] * scale, g.r[3] * scale];
+            let mut q = params;
+            // the quad is a pixel wider than the panel, for its anti-aliased edge
+            q.rect = [px[0] - 1.0, px[1] - 1.0, px[2] + 2.0, px[3] + 2.0];
+            q.glass = [g.radius * scale, g.strength, if g.dark { 1.0 } else { 0.0 }, scale];
+            q.bx = [px[0] + px[2] / 2.0, px[1] + px[3] / 2.0, px[2] / 2.0, px[3] / 2.0];
+            q.look = [g.look[0], g.look[1], g.look[2], g.look[3]];
+            q.look2 = [g.look[4], g.look[5], g.look[6], 0.0];
+            q.tint = g.tint;
+            q.border = g.border;
+            bytes[(i + 1) * stride..(i + 1) * stride + size].copy_from_slice(bytemuck::bytes_of(&q));
+        }
+        let uniform = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("picture"), contents: &bytes, usage: wgpu::BufferUsages::UNIFORM });
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("picture"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &uniform, offset: 0, size: wgpu::BufferSize::new(size as u64) }) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(main) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.smooth) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.crisp) },
@@ -478,8 +722,15 @@ impl GpuLayer {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, &bind, &[0]);
             pass.draw(0..6, 0..1);
+            if !glass.is_empty() {
+                pass.set_pipeline(&self.glass_pipeline);
+                for i in 0..glass.len() {
+                    pass.set_bind_group(0, &bind, &[((i + 1) * stride) as u32]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
         }
         self.queue.submit([enc.finish()]);
         frame.present();
@@ -489,5 +740,6 @@ impl GpuLayer {
     /// The layer is hidden for now: the next `render` draws even if nothing differs.
     pub fn forget(&mut self) {
         self.drawn = None;
+        self.drawn_glass.clear();
     }
 }
