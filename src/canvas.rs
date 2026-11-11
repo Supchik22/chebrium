@@ -24,8 +24,79 @@ pub struct Canvas<'a> {
     pub(crate) clip: [i32; 4],
 }
 
+thread_local! {
+    /// How much corners are smoothed into a squircle, 0 (circular arcs) .. 1 (see `set_corner_smoothing`). Per thread:
+    /// a window is drawn on one thread, and tests running side by side do not see each other's setting.
+    static CORNER_SMOOTHING: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Make every rounded rectangle drawn from now on use "continuous" corners: 0 keeps circular arcs, 1 is a full squircle
+/// (the corner curve starts further along the sides and bends gradually, a superellipse). The runtime sets it from the
+/// theme (`Appearance::corners`) before each frame.
+pub fn set_corner_smoothing(s: f32) {
+    CORNER_SMOOTHING.with(|c| c.set(s.clamp(0.0, 1.0)));
+}
+
+/// The theme's glass, as the shell writes it in `appearance.toml`: `look` = [blur, refraction, bezel, dispersion, rim,
+/// rim sharpness, saturation], the tint (rgb + strength) and the 1px border (rgb + opacity), and whether the theme is
+/// dark (the tint belongs to that). Set by the runtime before each frame, like the corner smoothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassLook {
+    pub look: [f32; 7],
+    pub tint: [f32; 4],
+    pub border: [f32; 4],
+    pub dark: bool,
+}
+
+impl Default for GlassLook {
+    fn default() -> GlassLook {
+        GlassLook { look: [5.0, 26.0, 24.0, 0.04, 0.85, 1.0, 1.22], tint: [1.0, 1.0, 1.0, 0.12], border: [0.0; 4], dark: false }
+    }
+}
+
+thread_local! {
+    static GLASS_LOOK: std::cell::Cell<GlassLook> = std::cell::Cell::new(GlassLook::default());
+}
+
+pub fn set_glass_look(g: GlassLook) {
+    GLASS_LOOK.with(|c| c.set(g));
+}
+
+pub fn glass_look() -> GlassLook {
+    GLASS_LOOK.with(|c| c.get())
+}
+
+pub fn corner_smoothing() -> f32 {
+    CORNER_SMOOTHING.with(|c| c.get())
+}
+
+/// The corner actually drawn for radius `r` on a box of half size `hw` x `hh`: (how far along each side the curve
+/// reaches, the superellipse exponent; 2 is a circle). With smoothing the curve reaches further than `r` (so the corner
+/// looks about as round as a circular one of radius `r`) and is flatter at its middle. Pills, circles and nearly-pills
+/// keep circular ends: a squircle pill looks boxy. The shaders of the shell and of the picture layer do the same.
+#[inline]
+pub fn corner_shape(r: f32, hw: f32, hh: f32) -> (f32, f32) {
+    let s = corner_smoothing();
+    let m = hw.min(hh);
+    if s <= 0.0 || r < 0.75 || m <= 0.0 {
+        return (r.min(m), 2.0);
+    }
+    // fade the smoothing out as the corner grows to the whole short side
+    let k = s * ((0.92 * m - r) / (0.3 * m)).clamp(0.0, 1.0);
+    if k <= 0.0 {
+        return (r.min(m), 2.0);
+    }
+    ((r * (1.0 + 0.45 * k)).min(m), 2.0 + 2.6 * k)
+}
+
 #[inline]
 fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let (r, n) = corner_shape(r, hw, hh);
+    if n > 2.0 {
+        let qx = (px - cx).abs() - hw + r;
+        let qy = (py - cy).abs() - hh + r;
+        return if qx > 0.0 && qy > 0.0 { (qx.powf(n) + qy.powf(n)).powf(1.0 / n) - r } else { qx.max(qy) - r };
+    }
     let qx = (px - cx).abs() - hw + r;
     let qy = (py - cy).abs() - hh + r;
     // Only inside a corner's square are both positive and the distance is a real hypotenuse. Everywhere else the
@@ -101,7 +172,7 @@ impl<'a> Canvas<'a> {
         let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
         let r = r.min(hw).min(hh);
         // past this margin from the sides a pixel's coverage does not depend on x
-        let m = r.max(1.0);
+        let m = corner_shape(r, hw, hh).0.max(1.0);
         let clip = self.clip;
         let mx0 = ((cx - hw + m).ceil() as i32).max(clip[0]);
         let mx1 = ((cx + hw - m).floor() as i32).min(clip[2]);
@@ -133,7 +204,7 @@ impl<'a> Canvas<'a> {
         if x0 >= x1 {
             return;
         }
-        let (inner, outer) = row_limits(py as f32 + 0.5, cy, hw, hh, r);
+        let (inner, outer) = shape_row_limits(py as f32 + 0.5, cy, hw, hh, r);
         // pixels with full coverage come in one stretch: they are blended together (`blend_span_float` does what
         // `blend` does to each, byte for byte)
         let row = py as usize * self.w;
@@ -202,7 +273,7 @@ impl<'a> Canvas<'a> {
         let clip = self.clip;
         // as in `fill_round_rect`: between the corner zones the coverage is the same along a row, and so is the colour
         // (the gradient is vertical), so that stretch is blended with one alpha; the result is the same as pixel by pixel
-        let m = r.max(1.0);
+        let m = corner_shape(r, hw, hh).0.max(1.0);
         let mx0 = ((cx - hw + m).ceil() as i32).max(clip[0]);
         let mx1 = ((cx + hw - m).floor() as i32).min(clip[2]);
         let start = (x.floor() as i32).max(clip[0]);
@@ -331,8 +402,9 @@ impl<'a> Canvas<'a> {
             let dy = (fy - cy).abs();
             // along a row the glass covers a known stretch; the shadow is only outside it
             let (s0, s1) = if dy < hh {
-                let over = dy - (hh - r);
-                let half = if over > 0.0 { hw - r + (r * r - over * over).max(0.0).sqrt() } else { hw };
+                let rr = corner_shape(r, hw, hh).0;
+                let over = dy - (hh - rr);
+                let half = if over > 0.0 { hw - rr + (rr * rr - over * over).max(0.0).sqrt() } else { hw };
                 (((cx - half + 1.0).ceil() as i32).clamp(sx0, sx1), ((cx + half - 1.0).floor() as i32).clamp(sx0, sx1))
             } else {
                 (sx1, sx1)
@@ -354,104 +426,87 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Liquid glass over what is already painted: the pixels under the rounded rectangle are blurred, bent at the
-    /// rim like a lens, tinted and given a lit edge. `scale` is the HiDPI factor of the canvas.
+    /// Liquid glass over what is already painted: the same glass as the shell's (`shade_glass` in its `glass.wgsl`, and
+    /// `fs_glass` of the picture layer), with the theme's look (`set_glass_look`): the backdrop bent in a band at the
+    /// rim by a lens, with a little colour dispersion, lightly blurred, saturated, tinted, lit from above by a crisp rim,
+    /// and a soft shadow under it. `scale` is the HiDPI factor of the canvas.
     ///
-    /// It is cheap because the blur never sees the full picture: the backdrop is sampled sparsely into a copy 4x smaller
-    /// in each direction, blurred there, and read back with bilinear filtering (a blur hides the loss). The lens maths
-    /// runs only in the band along the edge; the interior is one filtered read and one blend per pixel.
+    /// The blur reads a copy 2-4x smaller than the backdrop (a blur hides the loss); the lens, the dispersion and the
+    /// rim run only in the band along the edge, the interior is one filtered read and one blend per pixel.
     #[allow(clippy::too_many_arguments)]
     pub fn glass_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, dark: bool, strength: f32, scale: f32) {
-        const F: usize = 4;
+        let g = glass_look();
+        let fade = strength.clamp(0.0, 1.0);
+        if fade <= 0.0 || w < 1.0 || h < 1.0 {
+            return;
+        }
+        let sc = scale.max(0.5);
         let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
-        let r = r.min(hw).min(hh);
+        let (r, ex) = corner_shape(r.min(hw).min(hh), hw, hh);
+        // the soft shadow round the panel first: the glass then covers its inner part
+        self.glass_shadow(x, y, w, h, r, fade, scale);
         let clip = self.clip;
         let (bx0, by0) = ((x.floor() as i32).max(clip[0]), (y.floor() as i32).max(clip[1]));
         let (bx1, by1) = (((x + w).ceil() as i32).min(clip[2]), ((y + h).ceil() as i32).min(clip[3]));
         if bx0 >= bx1 || by0 >= by1 {
             return;
         }
-        // the backdrop the blur reads: the glass plus a margin, clamped to the canvas
-        let m = (10.0 * scale).ceil() as i32;
+        // the theme's tint is for the theme's own light or dark; the other one gets the liquid default (as `app.rs`)
+        let tint = if dark == g.dark { g.tint } else if dark { [0.08, 0.08, 0.09, 0.55] } else { [1.0, 1.0, 1.0, 0.12] };
+        let short = 2.0 * hw.min(hh);
+        let bezel = (g.look[2] * sc).min(short * 0.45);
+        let refr = (g.look[1] * sc).min((bezel * 1.15).min(short * 0.45));
+        let br = (g.look[0] * sc * 1.1).max(1.0);
+        let disp_k = g.look[3];
+        let rim_s = g.look[4];
+        let sat = if g.look[6] <= 0.0 { 1.15 } else { g.look[6] };
+        // the backdrop the glass reads: the panel plus what the lens and the blur reach, clamped to the canvas
+        let m = (refr * (1.0 + disp_k) + 2.0 * br + 4.0).ceil() as i32;
         let (rx0, ry0) = ((x.floor() as i32 - m).max(0), (y.floor() as i32 - m).max(0));
         let (rx1, ry1) = (((x + w).ceil() as i32 + m).min(self.w as i32), ((y + h).ceil() as i32 + m).min(self.h as i32));
-        // the backdrop at full resolution, before anything is drawn over it: the lens at the rim bends this, so the
-        // deformation of the picture near the edge and the corners is sharp while the middle stays frosted
-        let (rw, rh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
-        let mut sharp = Vec::with_capacity(rw * rh * 4);
-        for yy in ry0..ry1 {
-            let o = (yy as usize * self.w + rx0 as usize) * 4;
-            sharp.extend_from_slice(&self.data[o..o + rw * 4]);
+        let (rw, rh) = ((rx1 - rx0).max(1) as usize, (ry1 - ry0).max(1) as usize);
+        // full resolution copy, premultiplied R,G,B,A in 0..1 (the canvas is B,G,R,A)
+        let mut sharp = vec![[0f32; 4]; rw * rh];
+        for yy in 0..rh {
+            let o = ((ry0 as usize + yy) * self.w + rx0 as usize) * 4;
+            for xx in 0..rw {
+                let i = o + xx * 4;
+                let d = &self.data[i..i + 4];
+                sharp[yy * rw + xx] = [d[2] as f32 / 255.0, d[1] as f32 / 255.0, d[0] as f32 / 255.0, d[3] as f32 / 255.0];
+            }
         }
-        let (lw, lh) = (((rx1 - rx0) as usize).div_ceil(F).max(1), ((ry1 - ry0) as usize).div_ceil(F).max(1));
+        // the blur (about a gaussian of sigma br / 2, as the shell's mip read): a copy F times smaller, box passes there
+        let sigma = br * 0.5;
+        let f = if sigma >= 7.0 { 4 } else if sigma >= 2.2 { 2 } else { 1 };
+        let ls = sigma / f as f32;
+        let rb = (((1.5 * ls * ls + 0.25).sqrt() - 0.5).round() as usize).max(1);
+        let (lw, lh) = (rw.div_ceil(f).max(1), rh.div_ceil(f).max(1));
         let mut lo = vec![[0f32; 4]; lw * lh];
         for ly in 0..lh {
             for lx in 0..lw {
-                // eight taps of the 4x4 block (a checker): less shimmer when the picture under the glass moves
                 let mut acc = [0f32; 4];
-                for (ox, oy) in [(0, 0), (2, 0), (1, 1), (3, 1), (0, 2), (2, 2), (1, 3), (3, 3)] {
-                    let sx = (rx0 as usize + lx * F + ox).min(rx1 as usize - 1);
-                    let sy = (ry0 as usize + ly * F + oy).min(ry1 as usize - 1);
-                    let i = (sy * self.w + sx) * 4;
-                    for k in 0..4 {
-                        acc[k] += self.data[i + k] as f32;
+                let mut n = 0.0;
+                for oy in 0..f {
+                    for ox in 0..f {
+                        let (sx, sy) = ((lx * f + ox).min(rw - 1), (ly * f + oy).min(rh - 1));
+                        let c = sharp[sy * rw + sx];
+                        for k in 0..4 {
+                            acc[k] += c[k];
+                        }
+                        n += 1.0;
                     }
                 }
-                // the buffer is B,G,R,A; the small copy is R,G,B,A
-                lo[ly * lw + lx] = [acc[2], acc[1], acc[0], acc[3]].map(|v| v * (1.0 / (8.0 * 255.0)));
+                lo[ly * lw + lx] = acc.map(|v| v / n);
             }
         }
-        // two box passes in each direction ~ a gaussian of about 11 px
         let mut tmp = vec![[0f32; 4]; lw * lh];
         for _ in 0..2 {
-            box_blur(&lo, &mut tmp, lw, lh, 2, true);
-            box_blur(&tmp, &mut lo, lw, lh, 2, false);
+            box_blur(&lo, &mut tmp, lw, lh, rb, true);
+            box_blur(&tmp, &mut lo, lw, lh, rb, false);
         }
-        let strength = strength.clamp(0.0, 1.5);
-        // a pale, thin tint so that the backdrop shows through and stays vivid; in the dark theme the backdrop is also
-        // dimmed a little so that white icons read over a bright picture
-        let (tint, ta, dim, sat) = if dark { ([0.80f32, 0.86, 0.95], 0.16 * strength, 0.80, 1.55) } else { ([1.0f32, 1.0, 1.0], 0.34 * strength, 1.0, 1.35) };
-        let band = (hh.min(hw) * 0.7).min(18.0 * scale).max(1.0);
-        let rim_w = (1.5 * scale).max(1.0);
-        let bend = band;
-        let light = [-0.5f32, -0.866];
-        // the light on the edge: a thin bright rim, and under it a soft glow that fades over the lens band (the glass
-        // catches more light where it is steep), stronger on the side facing the light and faint on the far side
-        let lighting = |nx: f32, ny: f32, depth: f32| -> f32 {
-            let lit = nx * light[0] + ny * light[1];
-            let facing = lit.max(0.0) + (-lit).max(0.0) * 0.5;
-            let mut v = 0.0;
-            if depth < rim_w {
-                v = (1.0 - depth.max(0.0) / rim_w) * (if dark { 0.30 } else { 0.55 } + facing * if dark { 0.65 } else { 0.5 });
-            }
-            if depth < band {
-                let u = 1.0 - depth.max(0.0) / band;
-                v += u * u * u * (0.05 + facing * 0.11) * if dark { 1.0 } else { 0.6 };
-            }
-            v.min(0.95) * strength
-        };
-        let (tr, tg, tb) = (tint[0] * ta, tint[1] * ta, tint[2] * ta);
-        let keep = 1.0 - ta;
-        // the tint and the colour lift are affine, so they are applied to the small copy once, not to every pixel
-        let shade = |c: [f32; 4], sheen: f32| -> [f32; 4] {
-            let lum = (c[0] + c[1] + c[2]) * (1.0 / 3.0);
-            let ga = ta + c[3] * keep;
-            let lift = |v: f32, t: f32| (t + (lum + (v - lum) * sat).max(0.0) * dim * keep).min(ga);
-            let mut g = [lift(c[0], tr), lift(c[1], tg), lift(c[2], tb)];
-            for v in &mut g {
-                *v = *v * (1.0 - sheen) + sheen * ga;
-            }
-            [g[0], g[1], g[2], ga]
-        };
-        // a gloss over the upper part of the panel, fading downwards
-        let sheen_at = |py: f32| 0.16 * strength * (1.0 - (py - y) / (h * 0.62)).clamp(0.0, 1.0);
-        for (i, c) in lo.iter_mut().enumerate() {
-            *c = shade(*c, sheen_at(ry0 as f32 + ((i / lw) as f32 + 0.5) * F as f32));
-        }
-        let (data, stride) = (&mut *self.data, self.w);
-        let sample = |px: f32, py: f32| -> [f32; 4] {
-            let u = ((px - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
-            let v = ((py - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
+        let blurred = |px: f32, py: f32| -> [f32; 4] {
+            let u = ((px - rx0 as f32) / f as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
+            let v = ((py - ry0 as f32) / f as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
             let (u0, v0) = (u as usize, v as usize);
             let (u1, v1) = ((u0 + 1).min(lw - 1), (v0 + 1).min(lh - 1));
             let (fu, fv) = (u - u0 as f32, v - v0 as f32);
@@ -462,215 +517,124 @@ impl<'a> Canvas<'a> {
             }
             o
         };
-        // the rim is thin, so the nearest pixel is enough (and one read instead of four)
-        let sample_sharp = |px: f32, py: f32| -> [f32; 4] {
-            let u = ((px - rx0 as f32) as usize).min(rw - 1);
-            let v = ((py - ry0 as f32) as usize).min(rh - 1);
-            let i = (v * rw + u) * 4;
-            [sharp[i + 2] as f32 * (1.0 / 255.0), sharp[i + 1] as f32 * (1.0 / 255.0), sharp[i] as f32 * (1.0 / 255.0), sharp[i + 3] as f32 * (1.0 / 255.0)]
+        let crisp = |px: f32, py: f32| -> [f32; 4] {
+            let u = ((px - rx0 as f32 - 0.5).clamp(0.0, (rw - 1) as f32)) as usize;
+            let v = ((py - ry0 as f32 - 0.5).clamp(0.0, (rh - 1) as f32)) as usize;
+            sharp[v * rw + u]
         };
-        // shade one pixel: read the (bent) blurred backdrop, tint it, light the rim, blend by coverage
-        let put = |data: &mut [u8], px: i32, py: i32, sx: f32, sy: f32, rim: f32, cov: f32, w: f32| {
-            let mut b = sample(sx, sy);
-            if w > 0.0 {
-                let sh = shade(sample_sharp(sx, sy), sheen_at(sy));
-                for k in 0..4 {
-                    b[k] = b[k] * (1.0 - w) + sh[k] * w;
-                }
+        // the backdrop at a place, its blur taken off by `k` (the rim band shows the bend crisply)
+        let read = |px: f32, py: f32, k: f32| -> [f32; 4] {
+            let b = blurred(px, py);
+            if k <= 0.001 {
+                return b;
             }
-            let ga = b[3];
-            let mut g = [b[0], b[1], b[2]];
-            if rim > 0.0 {
-                for v in &mut g {
-                    *v = *v * (1.0 - rim) + rim * ga;
-                }
+            let c = crisp(px, py);
+            let mut o = [0f32; 4];
+            for i in 0..4 {
+                o[i] = b[i] + (c[i] - b[i]) * k;
             }
-            let i = (py as usize * stride + px as usize) * 4;
-            let new = [g[2], g[1], g[0], ga];
-            let icov = 1.0 - cov;
-            for k in 0..4 {
-                let v = (new[k].min(ga).min(1.0)) * 255.0;
-                data[i + k] = (data[i + k] as f32 * icov + v * cov + 0.5) as u8;
-            }
+            o
         };
-        // the part of the glass deeper than `band` has no lens and no rim: the same shape pulled in by `band`
-        let mut rowbuf = vec![[0f32; 4]; lw];
-        let (iw, ih, ir) = (hw - band, hh - band, (r - band).max(0.0));
-        // a soft shadow just below the panel, in the ring around it only (the glass covers the rest)
-        let sm = (6.0 * scale).ceil() as i32;
-        let off = 2.0 * scale;
-        if strength > 0.01 {
-            let (sx0, sx1) = ((bx0 - sm).max(clip[0]), (bx1 + sm).min(clip[2]));
-            let (sy0, sy1) = ((by0 - sm).max(clip[1]), (by1 + sm + off.ceil() as i32).min(clip[3]));
-            for py in sy0..sy1 {
-                let fy = py as f32 + 0.5;
-                let dy = (fy - cy).abs();
-                // along a row the glass covers a known stretch; the shadow is only outside it
-                let (s0, s1) = if dy < hh {
-                    let over = dy - (hh - r);
-                    let half = if over > 0.0 { hw - r + (r * r - over * over).max(0.0).sqrt() } else { hw };
-                    (((cx - half + 1.0).ceil() as i32).clamp(sx0, sx1), ((cx + half - 1.0).floor() as i32).clamp(sx0, sx1))
-                } else {
-                    (sx1, sx1)
-                };
-                for px in (sx0..s0).chain(s1..sx1) {
-                    let fx = px as f32 + 0.5;
-                    let d = sd_round_rect(fx, fy - off, cx, cy, hw, hh, r);
-                    if d >= sm as f32 {
-                        continue;
-                    }
-                    let t = 1.0 - d.max(0.0) / sm as f32;
-                    let a = 0.30 * strength * t * t;
-                    let i = (py as usize * stride + px as usize) * 4;
-                    for k in 0..3 {
-                        data[i + k] = (data[i + k] as f32 * (1.0 - a) + 0.5) as u8;
-                    }
-                    data[i + 3] = (255.0 * a + data[i + 3] as f32 * (1.0 - a) + 0.5) as u8;
-                }
-            }
-        }
+        let light = {
+            let l = (0.22f32 * 0.22 + 1.0).sqrt();
+            [-0.22 / l, -1.0 / l]
+        };
+        let smooth = |a: f32, b: f32, x: f32| {
+            let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let (data, stride) = (&mut *self.data, self.w);
+        // deeper than this nothing but the blur, the colour and the tint is left (the rim is far below one 8-bit step)
+        let deep = bezel.max(18.0 * sc);
         for py in by0..by1 {
             let fy = py as f32 + 0.5;
-            let dy = (fy - cy).abs();
-            // the interior of this row, [ix0, ix1)
-            let (ix0, ix1) = if dy < ih {
-                let over = dy - (ih - ir);
-                let half = if over > 0.0 { iw - ir + (ir * ir - over * over).max(0.0).sqrt() } else { iw };
-                (((cx - half).ceil() as i32).max(bx0), ((cx + half).floor() as i32).min(bx1))
-            } else {
-                (bx1, bx1)
-            };
-            let edge = |data: &mut [u8], px: i32| {
+            for px in bx0..bx1 {
                 let fx = px as f32 + 0.5;
-                let (dx, dyy) = (fx - cx, fy - cy);
-                let (qx, qy) = (dx.abs() - hw + r, dyy.abs() - hh + r);
-                let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
-                let cov = (0.5 - d).clamp(0.0, 1.0);
-                if cov <= 0.0 {
-                    return;
-                }
-                let depth = -d;
-                // outward normal of the rounded rectangle
-                let (nx, ny) = if qx > 0.0 && qy > 0.0 {
-                    let l = qx.hypot(qy);
-                    (qx / l * dx.signum(), qy / l * dyy.signum())
-                } else if qx > qy {
-                    (dx.signum(), 0.0)
+                let (dx, dy) = (fx - cx, fy - cy);
+                let (qx, qy) = (dx.abs() - hw + r, dy.abs() - hh + r);
+                let corner = qx > 0.0 && qy > 0.0;
+                let d = if corner {
+                    if ex > 2.0 { (qx.powf(ex) + qy.powf(ex)).powf(1.0 / ex) - r } else { qx.hypot(qy) - r }
                 } else {
-                    (0.0, dyy.signum())
+                    qx.max(qy) - r
                 };
-                let (mut sx, mut sy, mut rim, mut w) = (fx, fy, 0.0, 0.0);
-                if depth < band {
-                    // a lens: near the edge the glass shows what lies further in, squeezed
-                    let t = (depth.max(0.0) / band).min(1.0);
-                    let k = (1.0 - t) * (1.0 - t) * bend;
-                    sx -= nx * k;
-                    sy -= ny * k;
-                    let u = 1.0 - t;
-                    w = ((u - 0.45) / 0.55).max(0.0) * 0.95;
-                    rim = lighting(nx, ny, depth);
-                }
-                put(data, px, py, sx, sy, rim, cov, w);
-            };
-            if ix0 >= ix1 {
-                // a row in the top or bottom band: along its flat stretch the normal is straight up or down, so the lens
-                // shift, the rim and the coverage are the same for every pixel and the row is one horizontal lerp
-                let half = (hw - r).min(hw - hh + dy).max(0.0);
-                let (fx0, fx1) = (((cx - half).ceil() as i32).clamp(bx0, bx1), ((cx + half).floor() as i32).clamp(bx0, bx1));
-                let d = dy - hh;
-                let cov = (0.5 - d).clamp(0.0, 1.0);
-                if fx0 >= fx1 || cov <= 0.0 {
-                    for px in bx0..bx1 {
-                        edge(&mut *data, px);
-                    }
+                let cov = (0.5 - d).clamp(0.0, 1.0) * fade;
+                if cov <= 0.0 {
                     continue;
                 }
-                for px in bx0..fx0 {
-                    edge(&mut *data, px);
-                }
                 let depth = -d;
-                let ny = if fy < cy { -1.0 } else { 1.0 };
-                let (mut sy, mut rim, mut w) = (fy, 0.0, 0.0);
-                if depth < band {
-                    let t = (depth.max(0.0) / band).min(1.0);
-                    sy -= ny * (1.0 - t) * (1.0 - t) * bend;
-                    w = ((1.0 - t - 0.45) / 0.55).max(0.0) * 0.95;
-                    rim = lighting(0.0, ny, depth);
-                }
-                let v = ((sy - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
-                let (v0, fv) = (v as usize, v - v as usize as f32);
-                let v1 = (v0 + 1).min(lh - 1);
-                for (i, row) in rowbuf.iter_mut().enumerate() {
-                    let (a, b) = (lo[v0 * lw + i], lo[v1 * lw + i]);
-                    for k in 0..4 {
-                        row[k] = a[k] + (b[k] - a[k]) * fv;
-                    }
-                }
-                let icov = 1.0 - cov;
-                for px in fx0..fx1 {
-                    let u = ((px as f32 + 0.5 - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
-                    let (u0, fu) = (u as usize, u - u as usize as f32);
-                    let (a, b) = (rowbuf[u0], rowbuf[(u0 + 1).min(lw - 1)]);
-                    let mut g = [0f32; 4];
-                    for k in 0..4 {
-                        g[k] = a[k] + (b[k] - a[k]) * fu;
-                    }
-                    if w > 0.0 {
-                        let sh = shade(sample_sharp(px as f32 + 0.5, sy), sheen_at(sy));
-                        for k in 0..4 {
-                            g[k] = g[k] * (1.0 - w) + sh[k] * w;
-                        }
-                    }
-                    if rim > 0.0 {
-                        let ga = g[3];
-                        for v in &mut g[..3] {
-                            *v = *v * (1.0 - rim) + rim * ga;
-                        }
-                    }
-                    let o = (py as usize * stride + px as usize) * 4;
-                    let new = [g[2], g[1], g[0], g[3]];
-                    let dst = &mut data[o..o + 4];
-                    if cov >= 1.0 {
-                        for k in 0..4 {
-                            dst[k] = (new[k] * 255.0 + 0.5) as u8;
-                        }
+                let mut col;
+                let (mut nx, mut ny) = (0.0f32, 0.0f32);
+                if depth >= deep {
+                    col = blurred(fx, fy);
+                } else {
+                    // outward normal
+                    if corner {
+                        let (gx, gy) = (qx.powf(ex - 1.0), qy.powf(ex - 1.0));
+                        let l = gx.hypot(gy).max(1e-6);
+                        (nx, ny) = (gx / l * dx.signum(), gy / l * dy.signum());
+                    } else if qx > qy {
+                        nx = dx.signum();
                     } else {
-                        for k in 0..4 {
-                            dst[k] = (dst[k] as f32 * icov + new[k] * 255.0 * cov + 0.5) as u8;
-                        }
+                        ny = dy.signum();
+                    }
+                    let t = depth / bezel.max(1.0);
+                    let k = 1.0 - t.clamp(0.0, 1.0);
+                    let k2 = if t < 1.0 { k * k } else { 0.0 };
+                    let (ox, oy) = (-nx * k2 * refr, -ny * k2 * refr);
+                    let unblur = 0.8 * k2;
+                    col = read(fx + ox, fy + oy, unblur);
+                    if k2 > 0.0001 && disp_k >= 0.001 {
+                        col[0] = read(fx + ox * (1.0 + disp_k), fy + oy * (1.0 + disp_k), unblur)[0];
+                        col[2] = read(fx + ox * (1.0 - disp_k), fy + oy * (1.0 - disp_k), unblur)[2];
                     }
                 }
-                for px in fx1..bx1 {
-                    edge(&mut *data, px);
+                // saturation and tint, in premultiplied colour: the tint is opaque, so it also fills in the alpha
+                let a0 = col[3];
+                let lum = col[0] * 0.299 + col[1] * 0.587 + col[2] * 0.114;
+                for k in 0..3 {
+                    col[k] = (lum + (col[k] - lum) * sat).max(0.0);
                 }
-                continue;
-            }
-            for px in bx0..ix0 {
-                edge(&mut *data, px);
-            }
-            // the interior: blend the two cell rows once, then only a horizontal lerp per pixel
-            let v = ((fy - ry0 as f32) / F as f32 - 0.5).clamp(0.0, (lh - 1) as f32);
-            let (v0, fv) = (v as usize, v - v as usize as f32);
-            let v1 = (v0 + 1).min(lh - 1);
-            for (i, row) in rowbuf.iter_mut().enumerate() {
-                let (a, b) = (lo[v0 * lw + i], lo[v1 * lw + i]);
+                let ta = (tint[3] * strength.max(1.0)).min(0.92);
+                let a = a0 * (1.0 - ta) + ta;
+                for k in 0..3 {
+                    col[k] = col[k] * (1.0 - ta) + tint[k] * ta + 0.015 * a;
+                }
+                col[3] = a;
+                if depth < deep {
+                    let dl = depth / sc;
+                    if dl < 40.0 {
+                        let nd = nx * light[0] + ny * light[1];
+                        let edge = (-dl / 0.6).exp();
+                        let inner = (-dl / 3.2).exp();
+                        let top = nd.max(0.0).powf(2.2);
+                        let bottom = (-nd).max(0.0).powf(3.0) * 0.42;
+                        let l = if a > 0.0 { (col[0] * 0.299 + col[1] * 0.587 + col[2] * 0.114) / a } else { 0.0 };
+                        let rim_k = 1.0 + (0.45 - 1.0) * smooth(0.45, 0.9, l);
+                        let rim = rim_k * (edge * (0.10 + 0.85 * (top + bottom)) + inner * 0.10 * top) * rim_s;
+                        // light is added: it also makes the glass a little more solid there
+                        let na = (col[3] + rim).min(1.0);
+                        for k in 0..3 {
+                            col[k] += rim;
+                        }
+                        col[3] = na;
+                    }
+                    // a 1px inner border in the theme's border colour
+                    let band = (1.0 - smooth(0.0, 1.5, dl)) * g.border[3];
+                    if band > 0.0 {
+                        for k in 0..3 {
+                            col[k] = col[k] * (1.0 - band) + g.border[k] * band;
+                        }
+                        col[3] = col[3] * (1.0 - band) + band;
+                    }
+                }
+                let i = (py as usize * stride + px as usize) * 4;
+                let ga = col[3].min(1.0);
+                let new = [col[2].min(ga), col[1].min(ga), col[0].min(ga), ga];
+                let icov = 1.0 - cov;
                 for k in 0..4 {
-                    row[k] = a[k] + (b[k] - a[k]) * fv;
+                    data[i + k] = (data[i + k] as f32 * icov + new[k] * 255.0 * cov + 0.5) as u8;
                 }
-            }
-            for px in ix0..ix1 {
-                let u = ((px as f32 + 0.5 - rx0 as f32) / F as f32 - 0.5).clamp(0.0, (lw - 1) as f32);
-                let (u0, fu) = (u as usize, u - u as usize as f32);
-                let (a, b) = (rowbuf[u0], rowbuf[(u0 + 1).min(lw - 1)]);
-                let o = (py as usize * stride + px as usize) * 4;
-                let dst = &mut data[o..o + 4];
-                dst[0] = ((a[2] + (b[2] - a[2]) * fu) * 255.0 + 0.5) as u8;
-                dst[1] = ((a[1] + (b[1] - a[1]) * fu) * 255.0 + 0.5) as u8;
-                dst[2] = ((a[0] + (b[0] - a[0]) * fu) * 255.0 + 0.5) as u8;
-                dst[3] = ((a[3] + (b[3] - a[3]) * fu) * 255.0 + 0.5) as u8;
-            }
-            for px in ix1..bx1 {
-                edge(&mut *data, px);
             }
         }
     }
@@ -678,7 +642,7 @@ impl<'a> Canvas<'a> {
     /// Cut the four corners of the whole canvas to a rounded shape (alpha mask).
     pub fn mask_round_corners(&mut self, r: f32) {
         let (w, h) = (self.w as f32, self.h as f32);
-        let ri = r.ceil() as usize;
+        let ri = corner_shape(r, w / 2.0, h / 2.0).0.ceil() as usize;
         for &(x0, y0) in &[(0, 0), (self.w.saturating_sub(ri), 0), (0, self.h.saturating_sub(ri)), (self.w.saturating_sub(ri), self.h.saturating_sub(ri))] {
             for y in y0..(y0 + ri).min(self.h) {
                 for x in x0..(x0 + ri).min(self.w) {
@@ -749,7 +713,7 @@ fn box_blur(src: &[[f32; 4]], dst: &mut [[f32; 4]], w: usize, h: usize, r: usize
 pub(crate) fn flat_part(x: f32, y: f32, w: f32, h: f32, r: f32, a: f32, area: [i32; 4]) -> Option<(i32, i32, f32)> {
     let (cx, cy, hw, hh) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
     let r = r.min(hw).min(hh);
-    let m = r.max(1.0);
+    let m = corner_shape(r, hw, hh).0.max(1.0);
     // the same span as `fill_round_rect` works out, with the area as the clip
     let mx0 = ((cx - hw + m).ceil() as i32).max(area[0]);
     let mx1 = ((cx + hw - m).floor() as i32).min(area[2]);
@@ -790,6 +754,18 @@ pub(crate) fn clear_pixel(c: Rgb, a: f32) -> [u8; 4] {
 /// `|x - cx|`. Worked out from the same distance `sd_round_rect` gives (coverage is 1 where it is at most -0.5 and 0
 /// where it is at least 0.5), pulled in by a margin far wider than any rounding, so a pixel near the outline is left
 /// to the exact test.
+/// `row_limits` for the corner as drawn: a squircle holds the circle of its reach (so that circle's inside is surely
+/// covered) and lies inside its box (so beyond the box's side nothing is).
+fn shape_row_limits(fy: f32, cy: f32, hw: f32, hh: f32, r: f32) -> (f32, f32) {
+    let (rr, n) = corner_shape(r, hw, hh);
+    if n <= 2.0 {
+        return row_limits(fy, cy, hw, hh, rr);
+    }
+    let (inner, _) = row_limits(fy, cy, hw, hh, rr);
+    let outer = if (fy - cy).abs() >= hh + 0.5 + 0.01 { f32::NEG_INFINITY } else { hw + 0.5 + 0.01 };
+    (inner, outer)
+}
+
 fn row_limits(fy: f32, cy: f32, hw: f32, hh: f32, r: f32) -> (f32, f32) {
     const MARGIN: f32 = 0.01;
     let qy = (fy - cy).abs() - hh + r;
@@ -1036,6 +1012,48 @@ mod fast_path_tests {
                 assert!(fast == slow, "rect {rect:?} radius {r} alpha {a} clip {clip:?}");
             }
         }
+    }
+
+    #[test]
+    fn squircle_corners_fill_more_of_the_corner_and_keep_the_quick_path_exact() {
+        let (w, h) = (80usize, 60usize);
+        let draw = |smooth: f32| {
+            set_corner_smoothing(smooth);
+            let mut buf = vec![0u8; w * h * 4];
+            Canvas::new(&mut buf, w, h).fill_round_rect(4.0, 4.0, 70.0, 50.0, 14.0, [255, 255, 255], 1.0);
+            // the same shape pixel by pixel through the distance alone
+            let mut slow = vec![0u8; w * h * 4];
+            {
+                let mut c = Canvas::new(&mut slow, w, h);
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let d = sd_round_rect(x as f32 + 0.5, y as f32 + 0.5, 39.0, 29.0, 35.0, 25.0, 14.0);
+                        let cov = (0.5 - d).clamp(0.0, 1.0);
+                        if cov > 0.0 {
+                            c.blend(x, y, [255, 255, 255], cov);
+                        }
+                    }
+                }
+            }
+            set_corner_smoothing(0.0);
+            (buf, slow)
+        };
+        let (round, round_slow) = draw(0.0);
+        let (sq, sq_slow) = draw(1.0);
+        let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+        assert!(diff(&round, &round_slow) <= 1 && diff(&sq, &sq_slow) <= 1, "{} {}", diff(&round, &round_slow), diff(&sq, &sq_slow));
+        assert_ne!(round, sq);
+        // at the corner's diagonal the squircle bends gradually: a pixel just inside the circle's arc is still covered
+        // and the very corner stays empty either way
+        let alpha = |b: &[u8], x: usize, y: usize| b[(y * w + x) * 4 + 3];
+        assert_eq!(alpha(&sq, 4, 4), 0);
+        assert_eq!(alpha(&round, 4, 4), 0);
+        // the sides stay straight a shorter way: the squircle's curve reaches further along them
+        assert!(alpha(&sq, 4, 4 + 15) < alpha(&round, 4, 4 + 15), "{} vs {}", alpha(&sq, 4, 19), alpha(&round, 4, 19));
+        // a pill keeps round ends
+        set_corner_smoothing(1.0);
+        assert_eq!(corner_shape(10.0, 40.0, 10.0).1, 2.0);
+        set_corner_smoothing(0.0);
     }
 
     #[test]

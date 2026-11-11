@@ -146,6 +146,16 @@ pub struct Grade {
     pub saturation: f32,
 }
 
+/// A soft mask over a frame (0..255 each, row by row): what the card keeps sharp while it blurs the rest. Its size is its
+/// own (the card stretches it over the frame); `id` says whether the bytes are new.
+#[derive(Debug)]
+pub struct Mask {
+    pub id: u64,
+    pub w: u32,
+    pub h: u32,
+    pub data: Vec<u8>,
+}
+
 /// A live frame on the card, under the window's controls (see `Host::live`). Like `PictureLayer`, but the source is a
 /// [`Frame`] whose texture is updated in place.
 #[derive(Clone, Debug)]
@@ -162,6 +172,13 @@ pub struct LiveLayer {
     pub mirror: bool,
     /// a correction applied as it is drawn (none: the picture as the camera sends it)
     pub grade: Option<Grade>,
+    /// upscale with FSR 1 (edge-adaptive upscale and a contrast-adaptive sharpen) when the picture is drawn bigger than
+    /// it is; when it is not, or the card cannot, the usual filter is used
+    pub fsr: bool,
+    /// how much the FSR sharpen is held back, in stops: 0 is its sharpest, 2 hardly sharpens (0.2 is AMD's default)
+    pub fsr_stops: f32,
+    /// blur everything the mask does not cover, by this many texels of the frame
+    pub blur: Option<(Arc<Mask>, f32)>,
 }
 
 impl LiveLayer {
@@ -169,12 +186,30 @@ impl LiveLayer {
     /// the window shows `ground`.
     pub fn fitted(frame: Arc<Frame>, area: [f32; 4], ground: [f32; 3]) -> LiveLayer {
         let dest = fit(frame.w as f32, frame.h as f32, area);
-        LiveLayer { src: [0.0, 0.0, frame.w as f32, frame.h as f32], frame, dest, alpha: 1.0, ground, mirror: false, grade: None }
+        LiveLayer { src: [0.0, 0.0, frame.w as f32, frame.h as f32], frame, dest, alpha: 1.0, ground, mirror: false, grade: None, fsr: false, fsr_stops: 0.2, blur: None }
     }
 
     /// The same layer drawn with a correction.
     pub fn graded(mut self, grade: Option<Grade>) -> LiveLayer {
         self.grade = grade;
+        self
+    }
+
+    /// The same layer upscaled with FSR 1 where it is drawn bigger than the camera sends it.
+    pub fn upscaled(mut self, on: bool) -> LiveLayer {
+        self.fsr = on;
+        self
+    }
+
+    /// The FSR sharpen held back by `stops` (0 .. 2; see `fsr_stops`).
+    pub fn fsr_sharpness(mut self, stops: f32) -> LiveLayer {
+        self.fsr_stops = stops.clamp(0.0, 2.0);
+        self
+    }
+
+    /// The same layer with what the mask does not cover (the background behind a person) blurred by `radius` texels.
+    pub fn background_blur(mut self, mask: Option<Arc<Mask>>, radius: f32) -> LiveLayer {
+        self.blur = mask.filter(|_| radius > 0.5).map(|m| (m, radius.clamp(1.0, 64.0)));
         self
     }
 

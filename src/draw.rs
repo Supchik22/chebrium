@@ -9,6 +9,10 @@ pub enum Align {
 }
 
 pub trait Draw {
+    /// Device pixels per logical pixel of what this paints into (shapes that must sit on the pixel grid snap to it).
+    fn device_scale(&self) -> f32 {
+        1.0
+    }
     /// A rounded rectangle in one colour.
     fn fill(&mut self, r: [f32; 4], radius: f32, c: [f32; 3], alpha: f32);
     /// A rounded rectangle with a vertical gradient.

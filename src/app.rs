@@ -276,6 +276,10 @@ pub struct Host {
     /// A live frame (camera, video) to show on the card the same way; set it every frame, only when `gpu_layer` is true.
     /// Without a card, draw `frame.to_pic()` yourself. If both this and `layer` are set, this one is shown.
     pub live: Option<crate::live::LiveLayer>,
+    /// The program's own drawing on the card (see `scene`); set it every frame, only when `gpu_layer` is true. It wins
+    /// over `layer`; `live` wins over it.
+    #[cfg(feature = "gpu")]
+    pub scene: Option<crate::scene::SceneLayer>,
     /// the runtime can show a `layer` (set by the runtime; false when there is no graphics card to do it, so the program
     /// draws the picture itself)
     pub gpu_layer: bool,
@@ -313,6 +317,8 @@ impl Edge {
 enum Layer {
     Still(crate::picture::PictureLayer),
     Live(crate::live::LiveLayer),
+    #[cfg(feature = "gpu")]
+    Scene(crate::scene::SceneLayer),
 }
 
 /// Wakes the program from another thread: a decoder that finished a picture, a player with a new video frame. The
@@ -455,6 +461,10 @@ struct Runtime<A: App> {
     /// serial of the last pointer press: moving and resizing need it
     serial: u32,
     look_stamp: Option<std::time::SystemTime>,
+    /// the program draws its own frame: under another desktop it rounds its corners itself
+    client_frame: bool,
+    /// maximised, fullscreen or tiled: square corners
+    squared: bool,
     data_device_manager: DataDeviceManagerState,
     data_device: Option<DataDevice>,
     copy_source: Option<CopyPasteSource>,
@@ -784,6 +794,7 @@ impl<A: App + 'static> Runtime<A> {
         let result = match &l {
             Layer::Still(p) => gpu.render(size, fs, p, glass),
             Layer::Live(p) => gpu.render_live(size, fs, p, glass),
+            Layer::Scene(p) => gpu.render_scene(size, fs, p, glass),
         };
         match result {
             Ok(()) => {
@@ -829,6 +840,11 @@ impl<A: App + 'static> Runtime<A> {
             self.host.menu_bar = client.available() && self.host.appearance.menubar;
         }
         self.app.tick(&mut self.host);
+        crate::canvas::set_corner_smoothing(self.host.appearance.corners);
+        {
+            let l = &self.host.appearance;
+            crate::canvas::set_glass_look(crate::canvas::GlassLook { look: l.glass_look, tint: l.glass_tint, border: l.glass_border, dark: l.dark });
+        }
         let (bg, mut bg_a) = self.app.background(&self.host.appearance);
         let t_build = std::time::Instant::now();
         let dt = self.state.begin_frame();
@@ -842,12 +858,18 @@ impl<A: App + 'static> Runtime<A> {
         let mut cmds = recorder.cmds;
         // a picture on the card goes under the window: its own pixels are left see-through for it
         let (still, live) = (self.host.layer.take(), self.host.live.take());
-        let layer = live.map(Layer::Live).or(still.map(Layer::Still));
+        #[cfg(feature = "gpu")]
+        let still = self.host.scene.take().map(Layer::Scene).or(still.map(Layer::Still));
+        #[cfg(not(feature = "gpu"))]
+        let still = still.map(Layer::Still);
+        let layer = live.map(Layer::Live).or(still);
         let wanted = layer.is_some();
         // glass over that picture is made by the card (the picture is not on the processor's canvas to blur and bend)
         let dest = layer.as_ref().map(|l| match l {
             Layer::Still(p) => p.dest,
             Layer::Live(p) => p.dest,
+            #[cfg(feature = "gpu")]
+            Layer::Scene(p) => p.dest,
         });
         let over = |r: &[f32; 4]| dest.is_some_and(|d| r[0] < d[0] + d[2] && r[0] + r[2] > d[0] && r[1] < d[1] + d[3] && r[1] + r[3] > d[1]);
         let look = &self.host.appearance;
@@ -957,6 +979,14 @@ impl<A: App + 'static> Runtime<A> {
                     let all = kept.stale.iter().fold(kept.stale[0], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
                     kept.stale = vec![all];
                 }
+            }
+        }
+        // under another desktop nobody rounds the window: its corners are cut here (only where this frame painted, so a
+        // pixel is never cut twice)
+        if self.client_frame && self.host.appearance.foreign && !self.squared {
+            let radius = self.host.appearance.radius.clamp(0.0, 40.0) * fs;
+            if let Some(px) = self.buffers[i].buffer.canvas(&mut self.pool) {
+                round_corners(px, w, h, radius, &damage);
             }
         }
         let kept = self.buffers.remove(i);
@@ -1157,6 +1187,11 @@ impl<A: App + 'static> WindowHandler for Runtime<A> {
         self.width = w;
         self.height = h;
         self.host.maximized = configure.state.contains(WindowState::MAXIMIZED);
+        let squared = configure.state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN | WindowState::TILED_LEFT | WindowState::TILED_RIGHT | WindowState::TILED_TOP | WindowState::TILED_BOTTOM);
+        if squared != self.squared {
+            self.squared = squared;
+            self.frame.invalidate();
+        }
         self.host.activated = configure.is_activated();
         let first = !self.configured;
         self.configured = true;
@@ -1504,6 +1539,8 @@ pub fn run<A: App + 'static>(config: Config, app: A) {
         seat: None,
         serial: 0,
         look_stamp: Appearance::stamp(),
+        client_frame: config.decorations == Decorations::Client,
+        squared: false,
         data_device_manager,
         data_device: None,
         copy_source: None,
@@ -1601,5 +1638,57 @@ mod layout_tests {
         assert_eq!(qwerty_letter(21), Some('y'));
         assert_eq!(qwerty_letter(1), None);
         assert_eq!(qwerty_letter(51), None);
+    }
+}
+
+/// Make the corners of a premultiplied BGRA picture `w` x `h` see-through outside a rounded rectangle of `radius` px
+/// (smooth edge), only inside the `damage` boxes (x0, y0, x1, y1).
+pub(crate) fn round_corners(px: &mut [u8], w: usize, h: usize, radius: f32, damage: &[[i32; 4]]) {
+    if radius < 1.0 || w == 0 || h == 0 {
+        return;
+    }
+    let ri = (radius.ceil() as usize).min(w / 2).min(h / 2) as i32;
+    let (wi, hi) = (w as i32, h as i32);
+    // each corner: its square and the centre of its arc
+    let corners = [([0, 0], [radius, radius]), ([wi - ri, 0], [w as f32 - radius, radius]), ([0, hi - ri], [radius, h as f32 - radius]), ([wi - ri, hi - ri], [w as f32 - radius, h as f32 - radius])];
+    for (at, c) in corners {
+        let sq = [at[0], at[1], at[0] + ri, at[1] + ri];
+        for d in damage {
+            let (x0, y0, x1, y1) = (sq[0].max(d[0]).max(0), sq[1].max(d[1]).max(0), sq[2].min(d[2]).min(wi), sq[3].min(d[3]).min(hi));
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    // only the part beyond the arc's centre (towards the corner) is cut
+                    let dx = if c[0] < w as f32 / 2.0 { (c[0] - fx).max(0.0) } else { (fx - c[0]).max(0.0) };
+                    let dy = if c[1] < h as f32 / 2.0 { (c[1] - fy).max(0.0) } else { (fy - c[1]).max(0.0) };
+                    let cover = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+                    if cover < 1.0 {
+                        let i = (y as usize * w + x as usize) * 4;
+                        for b in &mut px[i..i + 4] {
+                            *b = (*b as f32 * cover).round() as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corner_tests {
+    #[test]
+    fn corners_are_cut_once_and_the_middle_is_kept() {
+        let (w, h) = (40usize, 30usize);
+        let mut px = vec![255u8; w * h * 4];
+        let all = [[0, 0, w as i32, h as i32]];
+        super::round_corners(&mut px, w, h, 8.0, &all);
+        assert_eq!(px[3], 0, "the very corner is clear");
+        assert_eq!(px[((15 * w) + 20) * 4 + 3], 255, "the middle stays");
+        let edge = px[((h - 1) * w + w - 1) * 4 + 3];
+        assert_eq!(edge, 0);
+        // a frame that painted only the middle leaves the corners as they were
+        let before = px.clone();
+        super::round_corners(&mut px, w, h, 8.0, &[[10, 10, 20, 20]]);
+        assert_eq!(px, before);
     }
 }

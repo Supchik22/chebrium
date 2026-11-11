@@ -70,7 +70,9 @@ pub fn key_body_shaped(ui: &mut Ui<'_>, r: [f32; 4], face: [f32; 3], ring: [f32;
     let depth = depth.clamp(0.0, 1.5);
     ui.fill([r[0], r[1] + 3.0 * depth.min(1.0), r[2], r[3]], rad, shadow.0, shadow.1 * depth.min(1.2));
     ui.fill(r, rad, ring, 1.0);
-    let inner = [r[0] + 2.5, r[1] + 2.5, r[2] - 5.0, r[3] - 5.0];
+    // the face inside the rim, its edges on device pixels (a half-pixel rim smears into the face)
+    let rim = ui.dev_px(2.5);
+    let inner = [r[0] + rim, r[1] + rim, r[2] - 2.0 * rim, r[3] - 2.0 * rim];
     let irad = (inner[3].min(inner[2]) / 2.0) * (0.28 + 0.72 * round.clamp(0.0, 1.0));
     let lift = 0.025 * wash - 0.05 * flash;
     let (up, down) = (0.05 * depth, 0.02 * depth);
@@ -82,16 +84,25 @@ pub fn key_body_shaped(ui: &mut Ui<'_>, r: [f32; 4], face: [f32; 3], ring: [f32;
 /// below, a slightly domed face with a faint sheen, and a deep shadow. `face` is the colour of the face's middle.
 #[allow(clippy::too_many_arguments)]
 pub fn key_body_dark(ui: &mut Ui<'_>, r: [f32; 4], face: [f32; 3], wash: f32, flash: f32, round: f32, depth: f32) {
+    key_body_dark_shadowed(ui, r, face, wash, flash, round, depth, 1.0);
+}
+
+/// [`key_body_dark`] with its shadow scaled by `shadow` (0: none, for a key that fills a groove).
+#[allow(clippy::too_many_arguments)]
+pub fn key_body_dark_shadowed(ui: &mut Ui<'_>, r: [f32; 4], face: [f32; 3], wash: f32, flash: f32, round: f32, depth: f32, shadow: f32) {
     let full = r[3].min(r[2]) / 2.0;
     let k = 0.28 + 0.72 * round.clamp(0.0, 1.0);
     let rad = full * k;
     let depth = depth.clamp(0.0, 1.5);
     let lift = 0.03 * wash - 0.05 * flash;
     let tone = |d: f32| [(face[0] + d + lift).clamp(0.0, 1.0), (face[1] + d + lift).clamp(0.0, 1.0), (face[2] + d + lift).clamp(0.0, 1.0)];
-    ui.fill([r[0], r[1] + 3.5 * depth.min(1.0), r[2], r[3]], rad, [0.0; 3], 0.55 * depth.min(1.2));
+    if shadow > 0.0 {
+        ui.fill([r[0], r[1] + 3.5 * depth.min(1.0), r[2], r[3]], rad, [0.0; 3], 0.55 * depth.min(1.2) * shadow);
+    }
     // the rim: lit along the top, dark along the bottom
     ui.grad(r, rad, tone(0.20 * depth.max(0.3)), tone(-0.12), 1.0);
-    let inner = [r[0] + 2.0, r[1] + 2.0, r[2] - 4.0, r[3] - 4.5];
+    let rim = ui.dev_px(2.0);
+    let inner = [r[0] + rim, r[1] + rim, r[2] - 2.0 * rim, r[3] - 2.0 * rim - ui.dev_px(0.5)];
     let irad = (inner[3].min(inner[2]) / 2.0) * k;
     ui.grad(inner, irad, tone(0.045 * depth), tone(-0.035 * depth), 1.0);
     // a faint sheen on the upper part of the dome

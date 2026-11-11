@@ -265,7 +265,9 @@ impl PopMenu {
             return None;
         }
         ui.push_clip(card);
-        let mouse_here = inside(ui.mouse, r);
+        // a deeper submenu lying over this panel (as last drawn) takes the pointer: this one is under it there
+        let covered = self.rects.iter().skip(depth + 1).take(self.open.len().saturating_sub(depth)).any(|d| inside(ui.mouse, *d));
+        let mouse_here = inside(ui.mouse, r) && !covered;
         let deepest = depth == self.open.len();
         // which row the highlight is on: the pointer's, else the keyboard's, else the row whose submenu is open
         let mut target: Option<(f32, bool)> = None;
@@ -445,5 +447,36 @@ mod tests {
         let mut m = PopMenu::new([100.0, 100.0], items());
         m.key(Key::Up);
         assert_eq!(m.cursor, Some(3));
+    }
+
+    #[test]
+    fn a_submenu_over_another_panel_keeps_the_pointer() {
+        // at the right edge: Settings opens to the left, its Preset opens to the right again, over the first panel
+        let preset = Item::parent("Preset", vec![Item::new(20, "Dolphin"), Item::new(21, "Icons"), Item::new(22, "Details")]);
+        let settings = Item::parent("Settings", vec![preset, Item::new(30, "Sidebar")]);
+        let list = vec![Item::new(1, "Zoom In"), Item::new(2, "Zoom Out"), Item::new(3, "Show Places Panel"), Item::new(4, "Show Status Bar"), settings, Item::new(5, "Terminal")];
+        let mut st = crate::ui::State::default();
+        let mut m = PopMenu::new([790.0, 100.0], list);
+        frame(&mut st, &mut m);
+        let r0 = m.rects[0];
+        st.pointer_move([r0[0] + 30.0, r0[1] + PAD + 4.0 * ROW + ROW / 2.0]);
+        frame(&mut st, &mut m);
+        assert_eq!(m.open, vec![4]);
+        let r1 = m.rects[1];
+        st.pointer_move([r1[0] + 30.0, r1[1] + PAD + ROW / 2.0]);
+        frame(&mut st, &mut m);
+        assert_eq!(m.open, vec![4, 0]);
+        let r2 = m.rects[2];
+        assert!(r2[0] < r0[0] + r0[2] && r2[0] + r2[2] > r0[0], "the third panel lies over the first one");
+        // the pointer on "Icons" (over a row of the first panel) stays in the submenu and picks it
+        let x = (r0[0].max(r2[0]) + (r0[0] + r0[2]).min(r2[0] + r2[2])) / 2.0;
+        let p = [x, r2[1] + PAD + ROW + ROW / 2.0];
+        assert!(inside(p, r0), "{r0:?} {r1:?} {r2:?} {p:?}");
+        st.pointer_move(p);
+        frame(&mut st, &mut m);
+        assert_eq!(m.open, vec![4, 0], "the first panel did not take the pointer");
+        st.pointer_down(p);
+        st.pointer_up();
+        assert_eq!(frame(&mut st, &mut m), Outcome::Chosen(21));
     }
 }

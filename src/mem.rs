@@ -35,6 +35,7 @@ mod tests {
 
     #[test]
     fn trimming_gives_freed_memory_back() {
+        let _one = crate::MEMORY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         tame_allocator();
         let before = resident_mib();
         // a big allocation made and freed on another thread, like a decoder's

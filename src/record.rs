@@ -55,6 +55,9 @@ impl<'a> Recorder<'a> {
 }
 
 impl Draw for Recorder<'_> {
+    fn device_scale(&self) -> f32 {
+        self.scale
+    }
     fn fill(&mut self, r: [f32; 4], radius: f32, c: [f32; 3], alpha: f32) {
         self.cmds.push(Cmd::Fill { r, radius, c, alpha });
     }

@@ -134,6 +134,9 @@ impl<'a, 'b> SoftDraw<'a, 'b> {
 }
 
 impl Draw for SoftDraw<'_, '_> {
+    fn device_scale(&self) -> f32 {
+        self.scale
+    }
     fn fill(&mut self, r: [f32; 4], radius: f32, c: [f32; 3], alpha: f32) {
         let r = self.rect(r);
         self.canvas.fill_round_rect(r[0], r[1], r[2], r[3], radius * self.scale, rgb8(c), alpha);

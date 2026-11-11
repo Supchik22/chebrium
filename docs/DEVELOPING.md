@@ -226,6 +226,19 @@ Live frames (camera, video) — `chebrium::live`
 - Keep capture and conversion off the UI thread. `CHEBRIUM_PERF=1` prints frame costs. A real-session check on the hybrid
   laptop is still needed before calling a GPU path done (see the compositor notes about PRIME).
 
+Your own drawing on the card — `chebrium::scene` (feature `gpu`)
+- For 3D views and anything a picture cannot carry: implement `scene::Scene::render(&mut self, gpu: &Gpu, target, size)`
+  (`gpu.device`, `gpu.queue`, `gpu.id`; make pipelines on the first call and again when `gpu.id` changes; `target` is a
+  `scene::FORMAT` (Rgba8Unorm, display values, no sRGB) texture of `size` device px, clear it yourself).
+- Each frame (only when `host.gpu_layer`): `host.scene = Some(SceneLayer { scene: Arc<Mutex<dyn Scene>>, version, dest,
+  ground })`. Bump `version` whenever anything shown changed: same version + same size = nothing is drawn. The runtime
+  renders the scene into a texture of `dest`'s size on the picture layer's card, then shows it like a picture (glass
+  panels over it work). Priority: `live` > `scene` > `layer`.
+- `scene::Offscreen::new(low_power)?.render(&mut scene, [w, h])` draws on a card of its own and reads back BGRA bytes:
+  use it in `Rig` tests (skip the test when it returns Err). Reference: `src/bin/memrium_maps` (`gpu.rs`, `card.rs`,
+  `tests.rs::card_frame`).
+- Keep a processor fallback for `gpu_layer == false` (the maps app keeps its old CPU renderer).
+
 ## 11. Conventions
 
 - Docs and comments in English; talk to the user in Ukrainian.

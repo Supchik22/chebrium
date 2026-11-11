@@ -53,11 +53,16 @@ pub struct Appearance {
     pub controls: crate::style::Controls,
     /// the desktop shows a menu bar with the menus of the program in front (a program may leave its own menus to it)
     pub menubar: bool,
+    /// running under another desktop (KDE, GNOME...): nobody frosts the glass or rounds the corners, so the window is
+    /// opaque and rounds its own corners
+    pub foreign: bool,
+    /// how far rounded corners are smoothed into squircles, 0 (circular) .. 1 (see `canvas::set_corner_smoothing`)
+    pub corners: f32,
 }
 
 impl Default for Appearance {
     fn default() -> Appearance {
-        Appearance { dark: true, accent: [0.23, 0.55, 1.0], radius: 22.0, titlebar: 40.0, decor: Decor::Mac, opacity: 0.84, glass_tint: [0.73, 0.84, 0.92, 0.11], glass_border: [0.0, 0.0, 0.0, 0.05], glass_look: [5.0, 26.0, 24.0, 0.04, 0.85, 1.0, 1.22], language: "auto".into(), controls: crate::style::Controls::default(), menubar: false }
+        Appearance { dark: true, accent: [0.23, 0.55, 1.0], radius: 22.0, titlebar: 40.0, decor: Decor::Mac, opacity: 0.84, glass_tint: [0.73, 0.84, 0.92, 0.11], glass_border: [0.0, 0.0, 0.0, 0.05], glass_look: [5.0, 26.0, 24.0, 0.04, 0.85, 1.0, 1.22], language: "auto".into(), controls: crate::style::Controls::default(), menubar: false, foreign: false, corners: 0.0 }
     }
 }
 
@@ -71,6 +76,12 @@ fn floats<const N: usize>(v: &toml::Value) -> Option<[f32; N]> {
         out[i] = x.as_float().or_else(|| x.as_integer().map(|n| n as f64))? as f32;
     }
     Some(out)
+}
+
+/// Is the window on the Memrium shell? Its sessions say so in `XDG_CURRENT_DESKTOP`; its nested and headless displays
+/// are the sockets `memrium-N`.
+pub fn on_memrium() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|x| x.eq_ignore_ascii_case("memrium"))) || std::env::var("WAYLAND_DISPLAY").is_ok_and(|w| w.starts_with("memrium"))
 }
 
 impl Appearance {
@@ -91,10 +102,16 @@ impl Appearance {
     /// The shell's look; without its file (another desktop is running) the defaults, with an opaque window: only the Liquid
     /// shell frosts the glass behind a translucent window, elsewhere it would just look washed out.
     pub fn load() -> Appearance {
-        match std::fs::read_to_string(Self::path()) {
+        let mut a = match std::fs::read_to_string(Self::path()) {
             Ok(t) => Self::parse(&t),
             Err(_) => Appearance { opacity: 1.0, ..Appearance::default() },
+        };
+        // the look file stays after the desktop is left: under another desktop the window is opaque all the same
+        if !on_memrium() {
+            a.opacity = 1.0;
+            a.foreign = true;
         }
+        a
     }
 
     /// Anything missing or malformed keeps its default.
@@ -111,6 +128,7 @@ impl Appearance {
         a.radius = num("radius").unwrap_or(a.radius);
         a.titlebar = num("titlebar").unwrap_or(a.titlebar);
         a.opacity = num("opacity").unwrap_or(a.opacity).clamp(0.0, 1.0);
+        a.corners = num("corners").unwrap_or(a.corners).clamp(0.0, 1.0);
         if let Some(v) = t.get("decoration").and_then(|v| v.as_str()) {
             a.decor = Decor::parse(v);
         }

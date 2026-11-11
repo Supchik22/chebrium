@@ -41,6 +41,8 @@ pub mod i18n;
 pub mod input;
 #[cfg(feature = "gpu")]
 pub mod layer;
+#[cfg(feature = "gpu")]
+pub mod scene;
 pub mod lucide;
 pub mod mem;
 pub mod live;
@@ -56,3 +58,8 @@ pub mod text;
 pub mod theme;
 pub mod ui;
 pub mod widgets;
+
+/// Tests that measure the process's memory, and tests that open a graphics card (whose driver takes a lot of it), do
+/// not run at the same time.
+#[cfg(test)]
+pub(crate) static MEMORY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());

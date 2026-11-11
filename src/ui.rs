@@ -279,6 +279,8 @@ pub struct Ui<'a> {
     next: u64,
     /// the text field being drawn hides what is typed (a password)
     mask: bool,
+    /// the field draws no plate of its own (it sits on one the program drew: a glass composer)
+    bare: bool,
     /// a control changed a value this frame
     pub changed: bool,
     anim: &'a mut Anims,
@@ -289,7 +291,7 @@ pub struct Ui<'a> {
 impl<'a> Ui<'a> {
     pub fn new(d: &'a mut dyn Draw, state: &'a mut State, style: Style, dt: f32) -> Ui<'a> {
         let State { mouse, held, click, double, mods, scroll, drag, edit, edit_end, edit_cur, edit_sel, anims, cursor, .. } = state;
-        Ui { d, mouse: *mouse, held: *held, click: *click, double: *double, mods: *mods, scroll: *scroll, drag, edit, edit_end, edit_cur, edit_sel, edit_seen: false, ink: style.ink, accent: style.accent, dark: style.dark, controls: style.controls, tint: None, next: 0, mask: false, changed: false, anim: anims, cursor, dt }
+        Ui { d, mouse: *mouse, held: *held, click: *click, double: *double, mods: *mods, scroll: *scroll, drag, edit, edit_end, edit_cur, edit_sel, edit_seen: false, ink: style.ink, accent: style.accent, dark: style.dark, controls: style.controls, tint: None, next: 0, mask: false, bare: false, changed: false, anim: anims, cursor, dt }
     }
 
     /// Start editing the text field `key` with `text` already in it (rename on F2, say).
@@ -331,6 +333,30 @@ impl<'a> Ui<'a> {
     /// Seconds since the previous frame: a program's own springs step by it.
     pub fn dt(&self) -> f32 {
         self.dt
+    }
+
+    /// Device pixels per logical pixel.
+    pub fn px(&self) -> f32 {
+        self.d.device_scale().max(0.25)
+    }
+
+    /// A logical coordinate moved onto the nearest device pixel boundary: an edge there is drawn crisp, not smeared
+    /// over two pixels.
+    pub fn on_grid(&self, v: f32) -> f32 {
+        let s = self.px();
+        (v * s).round() / s
+    }
+
+    /// A rectangle whose four edges sit on device pixel boundaries.
+    pub fn grid_rect(&self, r: [f32; 4]) -> [f32; 4] {
+        let (x0, y0, x1, y1) = (self.on_grid(r[0]), self.on_grid(r[1]), self.on_grid(r[0] + r[2]), self.on_grid(r[1] + r[3]));
+        [x0, y0, x1 - x0, y1 - y0]
+    }
+
+    /// `n` whole device pixels, in logical pixels (at least one).
+    pub fn dev_px(&self, n: f32) -> f32 {
+        let s = self.px();
+        (n * s).round().max(1.0) / s
     }
 
     /// Jump an eased value to `value` with no glide.
@@ -481,6 +507,15 @@ impl<'a> Ui<'a> {
         changed
     }
 
+    /// A text field without a plate or focus ring of its own: only the text, the selection and the caret. For a field
+    /// that sits on a panel the program draws itself (a glass composer, a search pill).
+    pub fn text_field_bare(&mut self, r: [f32; 4], key: &str, value: &mut String) -> bool {
+        self.bare = true;
+        let changed = self.text_field(r, key, value);
+        self.bare = false;
+        changed
+    }
+
     /// A single-line text field. Click to edit, Enter or a click elsewhere to apply, Esc to cancel.
     pub fn text_field(&mut self, r: [f32; 4], key: &str, value: &mut String) -> bool {
         let mut changed = false;
@@ -541,9 +576,13 @@ impl<'a> Ui<'a> {
         }
         if active {
             self.edit_seen = true;
-            self.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 8.0, self.accent, 0.55);
         }
-        self.fill(r, 7.0, self.ink, if active || hov { 0.12 } else { 0.07 });
+        if !self.bare {
+            if active {
+                self.fill([r[0] - 1.5, r[1] - 1.5, r[2] + 3.0, r[3] + 3.0], 8.0, self.accent, 0.55);
+            }
+            self.fill(r, 7.0, self.ink, if active || hov { 0.12 } else { 0.07 });
+        }
         let hide = |s: &str, mask: bool| if mask { "•".repeat(s.chars().count()) } else { s.to_string() };
         let mask = self.mask;
         match (active, self.edit.clone()) {
@@ -645,14 +684,14 @@ impl<'a> Ui<'a> {
         }
         // (in the dark a pale bed: a black one disappears into a dark card, and an off switch could not be seen)
         let (bed, a) = if self.dark { ([1.0, 1.0, 1.0], 0.16) } else { (self.ink, 0.17) };
-        self.fill(r, radius, bed, a);
+        // sunk in: the bed darker towards its upper edge, as one gradient over the groove's own shape (a separate band
+        // of shade could not follow the curve of the ends and would stop in a visible step)
+        let depth = self.controls.depth.min(1.2);
+        let top = bed.map(|v| v * (1.0 - (if self.dark { 0.45 } else { 0.6 }) * depth.min(1.0)));
+        self.grad(r, radius, top, bed, a * (1.0 + 0.25 * depth));
         if filled > 0.0 {
             self.fill(r, radius, self.accent_now(), filled);
         }
-        // the shade along the upper edge, the light along the lower
-        let depth = self.controls.depth.min(1.2);
-        self.fill([r[0] + radius * 0.5, r[1], (r[2] - radius).max(0.0), (r[3] * 0.24).max(2.0)], radius * 0.4, [0.0; 3], (if self.dark { 0.16 } else { 0.07 }) * depth);
-        self.fill([r[0] + radius * 0.7, r[1] + r[3] - 1.0, (r[2] - radius * 1.4).max(0.0), 1.0], 0.5, [1.0; 3], (if self.dark { 0.10 } else { 0.55 }) * depth);
     }
 
     /// The accent in a slider's groove up to where its knob is.
@@ -661,9 +700,13 @@ impl<'a> Ui<'a> {
             return;
         }
         let radius = self.controls.radius(radius);
-        self.fill([r[0], r[1], r[2].max(radius * 2.0), r[3]], radius, self.accent_now(), 1.0);
-        if !self.flat() {
-            self.fill([r[0] + radius * 0.5, r[1], (r[2] - radius).max(0.0), (r[3] * 0.30).max(2.0)], radius * 0.4, [0.0; 3], 0.14 * self.controls.depth.min(1.2));
+        let a = self.accent_now();
+        if self.flat() {
+            self.fill([r[0], r[1], r[2].max(radius * 2.0), r[3]], radius, a, 1.0);
+        } else {
+            // sunk like the groove: darker towards the upper edge, one gradient over its own shape
+            let k = 1.0 - 0.16 * self.controls.depth.min(1.2);
+            self.grad([r[0], r[1], r[2].max(radius * 2.0), r[3]], radius, a.map(|v| v * k), a, 1.0);
         }
     }
 
@@ -744,8 +787,16 @@ impl<'a> Ui<'a> {
         if self.click && self.hit(hot) {
             *self.drag = Some(id);
         }
+        let (kw, kh) = if self.flat() { (self.controls.thick(18.0, 16.0), self.controls.thick(11.0, 16.0)) } else { (self.controls.thick(20.0, 21.0), self.controls.thick(13.0, 21.0)) };
+        // the knob stays on the track: at either end its side is flush with the track's end
+        let travel = (r[2] - kw).max(1.0);
+        let x0 = r[0] + kw / 2.0;
+        // how far the pointer is dragged past an end (px; minus: past the start), for the knob's squash
+        let mut over = 0.0;
         if self.held && *self.drag == Some(id) {
-            let t = ((self.mouse[0] - r[0]) / r[2]).clamp(0.0, 1.0);
+            let raw = (self.mouse[0] - x0) / travel;
+            let t = raw.clamp(0.0, 1.0);
+            over = (raw - t) * travel;
             let nv = min + t * (max - min);
             if (nv - *v).abs() > 1e-4 {
                 *v = nv;
@@ -754,15 +805,29 @@ impl<'a> Ui<'a> {
         }
         let t = ((*v - min) / (max - min)).clamp(0.0, 1.0);
         let cy = r[1] + r[3] / 2.0;
-        // a groove with the accent filling it, and a round domed knob on the end of the fill
+        // a groove with the accent filling it to the knob's middle, and a round domed knob
         // slim: a thin rail and a knob squashed into a short pill
         let rail = if self.flat() { self.controls.thick(3.0, 6.0) } else { self.controls.thick(4.0, 8.0) };
-        self.groove([r[0], cy - rail / 2.0, r[2], rail], rail / 2.0, 0.0);
-        self.groove_fill([r[0], cy - rail / 2.0, (r[2] * t).max(0.0), rail], rail / 2.0);
-        let kx = r[0] + r[2] * t;
+        let track = self.grid_rect([r[0], cy - rail / 2.0, r[2], rail]);
+        self.groove(track, track[3] / 2.0, 0.0);
+        let mut kx = x0 + travel * t;
+        // pressed against the end: the further past it, the flatter (with less and less give), and it springs back
+        // when let go; the side against the end stays where it is
+        let push = (1.0 - (-over.abs() / 40.0).exp()) * over.signum();
+        let squash = self.ease(id * 64 + 7, push, if over != 0.0 { 30.0 } else { 14.0 });
+        let sq = squash.abs().min(1.0);
+        let (w, h) = (kw * (1.0 - 0.32 * sq), kh * (1.0 + 0.14 * sq));
+        if squash > 0.0 {
+            kx = r[0] + r[2] - w / 2.0;
+        } else if squash < 0.0 {
+            kx = r[0] + w / 2.0;
+        }
+        self.groove_fill([track[0], track[1], (kx - track[0]).max(0.0), track[3]], track[3] / 2.0);
         let held = *self.drag == Some(id);
-        let (kw, kh) = if self.flat() { (self.controls.thick(18.0, 16.0), self.controls.thick(11.0, 16.0)) } else { (self.controls.thick(20.0, 21.0), self.controls.thick(13.0, 21.0)) };
-        self.knob_wh([kx, cy], kw, kh, if held || self.hit(hot) { 1.0 } else { 0.0 });
+        // at rest on the pixel grid (a knob between pixels has soft sides)
+        let knob = [kx - w / 2.0, cy - h / 2.0, w, h];
+        let knob = if sq < 1e-3 && !(held && self.held) { self.grid_rect(knob) } else { knob };
+        self.knob_wh([knob[0] + knob[2] / 2.0, knob[1] + knob[3] / 2.0], knob[2], knob[3], if held || self.hit(hot) { 1.0 } else { 0.0 });
         held && self.held
     }
 
@@ -771,35 +836,41 @@ impl<'a> Ui<'a> {
     pub fn segmented(&mut self, r: [f32; 4], opts: &[&str], sel: &mut usize) -> bool {
         let n = opts.len().max(1) as f32;
         let flat = self.flat();
+        // pixel perfect: the groove and the resting pill have every edge on a device pixel
+        let r = self.grid_rect(r);
         self.groove(r, (r[3] / 2.0).min(14.0), 0.0);
-        let sw = (r[2] - 6.0) / n;
+        // the pill fills the groove's height edge to edge (no margin round it: any gap reads as a seam)
+        let inset = 0.0;
+        let sw = (r[2] - 2.0 * inset) / n;
         let base = self.id() * 64;
         let pos = self.ease(base, *sel as f32, 15.0);
         let travel = (pos - pos.round()).abs();
         let squeeze = 1.0 - 0.10 * (travel * 2.0).min(1.0);
-        // (the pill's shadow falls three pixels below it: it is kept inside the groove)
-        let (ph, py) = (r[3] - 6.0, r[1] + 2.0);
-        let pill = [r[0] + 3.0 + pos * sw + sw * (1.0 - squeeze) / 2.0, py + ph * (1.0 - squeeze) / 2.0, sw * squeeze, ph * squeeze];
-        let (mut face, mut ring, shadow) = if self.dark { ([0.377, 0.377, 0.377], [0.58, 0.63, 0.72], ([0.0, 0.0, 0.0], 0.45)) } else { ([0.95, 0.96, 0.98], [1.0, 1.0, 1.0], ([0.30, 0.38, 0.46], 0.28)) };
+        let (ph, py) = (r[3] - 2.0 * inset, r[1] + inset);
+        let pill = [r[0] + inset + pos * sw + sw * (1.0 - squeeze) / 2.0, py + ph * (1.0 - squeeze) / 2.0, sw * squeeze, ph * squeeze];
+        // at rest on the grid; while it glides it moves smoothly
+        let pill = if travel < 1e-3 { self.grid_rect(pill) } else { pill };
+        let (mut face, mut ring, shadow) = if self.dark { ([0.377, 0.377, 0.377], [0.58, 0.63, 0.72], ([0.0, 0.0, 0.0], 0.0)) } else { ([0.95, 0.96, 0.98], [1.0, 1.0, 1.0], ([0.30, 0.38, 0.46], 0.0)) };
         let accent_pick = self.controls.accent_pick;
         if accent_pick {
             face = [self.accent_now()[0] * 0.9 + 0.1, self.accent_now()[1] * 0.9 + 0.1, self.accent_now()[2] * 0.9 + 0.1];
-            ring = [self.accent_now()[0] * 0.45 + 0.55, self.accent_now()[1] * 0.45 + 0.55, self.accent_now()[2] * 0.45 + 0.55];
+            // the rim only a shade lighter than the face: a pale rim reads as a gap between the pill and the groove
+            ring = face.map(|v| v + (1.0 - v) * 0.16);
         }
         if flat {
             let rad = self.controls.radius(6.0);
-            self.fill([pill[0], pill[1] - 1.0, pill[2], pill[3] + 2.0], rad, if accent_pick { self.accent_now() } else { [1.0; 3] }, if accent_pick { 1.0 } else if self.dark { 0.20 } else { 0.95 });
+            self.fill(pill, rad, if accent_pick { self.accent_now() } else { [1.0; 3] }, if accent_pick { 1.0 } else if self.dark { 0.20 } else { 0.95 });
         } else {
             let (round, depth) = (self.controls.round, self.controls.depth);
             if self.dark && !accent_pick {
-                crate::retro::key_body_dark(self, pill, [0.299, 0.299, 0.299], 0.0, 0.0, round, depth);
+                crate::retro::key_body_dark_shadowed(self, pill, [0.299, 0.299, 0.299], 0.0, 0.0, round, depth, 0.0);
             } else {
                 crate::retro::key_body_shaped(self, pill, face, ring, shadow, 0.0, 0.0, round, depth);
             }
         }
         let mut changed = false;
         for (i, o) in opts.iter().enumerate() {
-            let sr = [r[0] + 3.0 + i as f32 * sw, py, sw, ph];
+            let sr = [r[0] + inset + i as f32 * sw, py, sw, ph];
             let selected = i == *sel;
             let hov = self.hit(sr);
             if hov {
@@ -916,5 +987,80 @@ mod edit_tests {
         st.key(Key::Left, shift);
         typed(&mut st, "X");
         assert_eq!(st.edit.as_ref().unwrap().1, "abX");
+    }
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+    use crate::canvas::Canvas;
+    use crate::soft::{Gfx, SoftDraw};
+
+    const W: usize = 240;
+    const H: usize = 40;
+
+    /// One frame of a slider over x 20..220; returns the pixels (BGRA) and the value.
+    fn frame(st: &mut State, gfx: &mut Gfx, v: &mut f32) -> Vec<u8> {
+        let mut buf = vec![0u8; W * H * 4];
+        {
+            let mut canvas = Canvas::new(&mut buf, W, H);
+            let mut painter = SoftDraw::new(&mut canvas, gfx);
+            let dt = st.begin_frame();
+            let mut ui = Ui::new(&mut painter, st, Style::new(false, [0.2, 0.5, 1.0]), dt);
+            ui.slider_bare([20.0, 10.0, 200.0, 20.0], v, 0.0, 1.0);
+            let seen = ui.edit_seen;
+            st.end_frame(seen);
+        }
+        if let Ok(dir) = std::env::var("TMP_SHOT_DIR") {
+            let mut rgba = buf.clone();
+            rgba.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+            let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            let _ = image::save_buffer(std::path::Path::new(&dir).join(format!("slider-{n}.png")), &rgba, W as u32, H as u32, image::ColorType::Rgba8);
+        }
+        buf
+    }
+
+    /// The columns (x) where something is painted on the knob's row.
+    fn painted(buf: &[u8], y: usize) -> (usize, usize) {
+        let xs: Vec<usize> = (0..W).filter(|&x| buf[(y * W + x) * 4 + 3] > 20).collect();
+        (*xs.first().unwrap_or(&0), *xs.last().unwrap_or(&0))
+    }
+
+    #[test]
+    fn the_knob_ends_flush_with_the_track_and_squashes_when_pushed_past_it() {
+        let (mut st, mut gfx) = (State::default(), Gfx::new());
+        let mut v = 1.0;
+        let buf = frame(&mut st, &mut gfx, &mut v);
+        // at the end the knob does not stick out past the track (220), a pixel of anti-aliasing at most
+        let (_, right) = painted(&buf, 23);
+        assert!(right <= 220, "knob reaches x {right}");
+        // dragged far past the end: still at the end, the value at most 1, the knob narrower than at rest
+        // the knob's width on a row below the rail (only the knob is painted there)
+        let knob_w = |buf: &[u8]| {
+            let (l, r) = painted(buf, 23);
+            r - l
+        };
+        let rest = knob_w(&buf);
+        st.pointer_move([205.0, 20.0]);
+        frame(&mut st, &mut gfx, &mut v);
+        st.pointer_down([205.0, 20.0]);
+        frame(&mut st, &mut gfx, &mut v);
+        st.pointer_move([300.0, 20.0]);
+        let mut last = Vec::new();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            last = frame(&mut st, &mut gfx, &mut v);
+        }
+        assert!(v <= 1.0 && v > 0.99, "{v}");
+        let pushed = knob_w(&last);
+        assert!(pushed + 3 < rest, "pushed {pushed} vs at rest {rest}");
+        assert!(painted(&last, 23).1 <= 220);
+        // let go: it springs back to its own width
+        st.pointer_up();
+        for _ in 0..80 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            last = frame(&mut st, &mut gfx, &mut v);
+        }
+        assert_eq!(knob_w(&last), rest);
     }
 }
