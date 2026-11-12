@@ -174,7 +174,7 @@ impl Appearance {
         let thin = if self.opacity >= 0.999 { 0.0 } else if self.dark { 0.06 } else { 0.02 };
         let alpha = if self.opacity >= 0.999 { 1.0 } else { (self.opacity - thin).max(0.30) };
         if self.dark {
-            ([0.10, 0.13, 0.20], alpha)
+            ([0.13, 0.13, 0.14], alpha)
         } else {
             ([0.97, 0.98, 1.0], alpha)
         }
@@ -183,7 +183,7 @@ impl Appearance {
     /// A little lighter / darker than the background: bars and panels on top of it.
     pub fn panel(&self) -> [f32; 3] {
         if self.dark {
-            [0.16, 0.19, 0.28]
+            [0.19, 0.19, 0.21]
         } else {
             [1.0, 1.0, 1.0]
         }
